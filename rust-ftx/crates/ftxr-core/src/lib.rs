@@ -20,6 +20,7 @@ pub mod modulate;
 pub mod protocol;
 pub mod telemetry;
 
+pub use ft8::ap::QsoProgress;
 pub use telemetry::{DecodeTelemetry, FecMethod};
 
 /// Digital mode supported by `ftxr-core`.

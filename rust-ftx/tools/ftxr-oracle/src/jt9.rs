@@ -153,6 +153,7 @@ pub struct Jt9RunConfig {
     pub his_call: Option<String>,
     pub his_grid: Option<String>,
     pub qso_progress: Option<u8>,
+    pub nexp_decode: Option<u8>,
     pub allow_a8: bool,
     pub timeout_secs: u64,
 }
@@ -172,6 +173,7 @@ impl Jt9RunConfig {
             his_call: None,
             his_grid: None,
             qso_progress: None,
+            nexp_decode: None,
             allow_a8: false,
             timeout_secs: 60,
         }
@@ -213,6 +215,11 @@ impl Jt9RunConfig {
             self.freq_tol_hz.to_string(),
         ];
 
+        if let Some(exp) = self.nexp_decode {
+            args.push("-X".to_string());
+            args.push(exp.to_string());
+        }
+
         match self.profile {
             Jt9Profile::BlindNoAp => {
                 args.extend([
@@ -235,22 +242,29 @@ impl Jt9RunConfig {
                 ]);
             }
             Jt9Profile::QsoAp => {
-                let my = self.my_call.as_deref().unwrap_or("N0AAA");
-                let his = self.his_call.as_deref().unwrap_or("K9BBB");
-                let grid = if self.allow_a8 {
+                let quote_f90 = |s: &str| -> String {
+                    if s.contains('/') || s.contains(' ') || s.contains(',') || s.contains('\'') {
+                        format!("'{}'", s.replace('\'', "''"))
+                    } else {
+                        s.to_string()
+                    }
+                };
+                let my = quote_f90(self.my_call.as_deref().unwrap_or("N0AAA"));
+                let his = quote_f90(self.his_call.as_deref().unwrap_or("K9BBB"));
+                let grid = quote_f90(if self.allow_a8 {
                     self.his_grid.as_deref().unwrap_or("DM79")
                 } else {
                     // Length < 4 suppresses `ft8_a8d` while preserving `a1`..`a6`.
                     "."
-                };
+                });
                 let prog = self.qso_progress.unwrap_or(1);
                 args.extend([
                     "-c".into(),
-                    my.into(),
+                    my,
                     "-x".into(),
-                    his.into(),
+                    his,
                     "-g".into(),
-                    grid.into(),
+                    grid,
                     "-Q".into(),
                     prog.to_string(),
                 ]);
@@ -837,5 +851,9 @@ mod tests {
         let args = qso.base_args().unwrap();
         assert!(args.windows(2).any(|w| w == ["-g", "."]));
         assert!(args.windows(2).any(|w| w == ["-Q", "2"]));
+
+        qso.his_call = Some("KH1/KH7Z".into());
+        let h_args = qso.base_args().unwrap();
+        assert!(h_args.windows(2).any(|w| w == ["-x", "'KH1/KH7Z'"]));
     }
 }

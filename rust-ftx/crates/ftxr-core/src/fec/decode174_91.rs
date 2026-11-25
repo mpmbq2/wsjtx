@@ -9,8 +9,8 @@ use super::osd::{osd174_91, OsdScratch};
 
 /// Hybrid BP + OSD decoder matching `wsjtx/lib/ft8/decode174_91.f90`.
 ///
-/// In Stage 2, `max_osd < 0` executes Belief Propagation only; Stage 3 enables `osd174_91`
-/// over `bp.zsave`.
+/// `max_osd < 0` executes Belief Propagation only; `max_osd == 0` invokes `osd174_91` on
+/// raw channel LLRs; `max_osd in 1..=3` invokes `osd174_91` over saved BP posterior sums `zsave`.
 pub fn decode174_91(
     llr: &[f32; LDPC_N],
     keff: usize,
@@ -52,4 +52,52 @@ pub fn decode174_91(
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::hashtable::CallsignHashTable;
+    use crate::protocol::ldpc::encode174_91;
+    use crate::protocol::pack77::pack77;
+    use crate::protocol::types::UnpackContext;
+
+    #[test]
+    fn hybrid_bp_plus_osd_recovers_when_bp_alone_fails() {
+        let ht = CallsignHashTable::new();
+        let ctx = UnpackContext::default();
+        let packed = pack77("CQ N0AAA EM10", None, &ctx, &ht).unwrap();
+        let cw = encode174_91(&packed.bits);
+
+        // Construct an LLR pattern where BP-only (max_osd = -1) fails, yet OSD (max_osd = 2) succeeds.
+        // Flip 24 bits with moderate confidence (-1.5) and weaken several others (+0.3).
+        let mut llr = [0.0_f32; LDPC_N];
+        for i in 0..LDPC_N {
+            let sign = if cw[i] == 1 { 1.0_f32 } else { -1.0_f32 };
+            llr[i] = sign * 2.2;
+        }
+        for idx in (0..LDPC_N).step_by(7) {
+            let sign = if cw[idx] == 1 { -1.0_f32 } else { 1.0_f32 };
+            llr[idx] = sign * 1.4;
+        }
+
+        let mut osd_scratch = OsdScratch::new();
+        let apmask = [0u8; LDPC_N];
+
+        // BP only fails:
+        assert!(decode174_91(&llr, 91, -1, 2, &apmask, &mut osd_scratch).is_none());
+
+        // Hybrid BP+OSD recovers exact codeword and recomputes channel dmin:
+        let dec = decode174_91(&llr, 91, 2, 2, &apmask, &mut osd_scratch)
+            .expect("OSD should rescue failed BP frame");
+        assert_eq!(dec.codeword, cw);
+        assert!(matches!(dec.fec_method, crate::telemetry::FecMethod::Osd { .. }));
+        assert!(dec.nhard_errors > 0);
+
+        let expected_dmin: f32 = (0..LDPC_N)
+            .filter(|&b| (if llr[b] >= 0.0 { 1u8 } else { 0u8 }) != cw[b])
+            .map(|b| llr[b].abs())
+            .sum();
+        assert!((dec.dmin - expected_dmin).abs() < 1e-4);
+    }
 }

@@ -4,12 +4,14 @@
 
 //! Development-only WSJT-X oracle harness (`ftxr-oracle`).
 //!
-//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`.
+//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`, `osd-oracle`, `ft8-stage3`.
 
 mod codec_oracle;
 mod corpus;
 mod ft8_mvp_bench;
+mod ft8_stage3;
 mod jt9;
+mod osd_oracle;
 mod scorecard;
 mod sim;
 mod smoke;
@@ -231,6 +233,39 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Stage 3 Suite A: Fortran `osd174_91` vs Rust bit-exact OSD oracle.
+    OsdOracle {
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Stage 3 FT8 weak-signal parity suites (B, C, D, E).
+    Ft8Stage3 {
+        /// Comma-separated suites to run (b, c, d, e, or all).
+        #[arg(long, value_delimiter = ',', default_values_t = ["all".to_string()])]
+        suites: Vec<String>,
+        /// AWGN trials per SNR for Rust decoder (Suite C).
+        #[arg(long, default_value_t = 100)]
+        trials: usize,
+        /// AWGN trials per SNR for jt9 oracle cross-check (Suite C).
+        #[arg(long, default_value_t = 100)]
+        jt9_trials: usize,
+        /// Number of pure-AWGN noise slots for false-positive audit (Suite E).
+        #[arg(long, default_value_t = 500)]
+        noise_slots: usize,
+        /// Optional comma-separated subset of Suite C cliff configs to run.
+        #[arg(long, value_delimiter = ',')]
+        cliff_configs: Option<Vec<String>>,
+        /// Optional wall-clock checkpoint limit (seconds); pauses cleanly before next step.
+        #[arg(long)]
+        max_wall_secs: Option<u64>,
+        /// Enable fresh-binary incremental step caching under `.oracle-cache/stage3-resume/`.
+        #[arg(long)]
+        resume: bool,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn default_rust_ftx_root() -> PathBuf {
@@ -418,6 +453,49 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 out.as_deref(),
             )?;
         }
+        Commands::OsdOracle { out } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let resolved_bin_dir = sim.bin_path("jt9").parent().unwrap().to_path_buf();
+            osd_oracle::run_suite_a_osd_oracle(
+                &rust_ftx_root,
+                &resolved_bin_dir,
+                &cache_dir,
+                out.as_deref(),
+            )?;
+        }
+        Commands::Ft8Stage3 {
+            suites,
+            trials,
+            jt9_trials,
+            noise_slots,
+            cliff_configs,
+            max_wall_secs,
+            resume,
+            out,
+        } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let resolved_bin_dir = sim.bin_path("jt9").parent().unwrap().to_path_buf();
+            let jt9 = Jt9Runner::new(resolved_bin_dir.clone(), cache_dir.clone());
+            let opts = ft8_stage3::Stage3Options {
+                suites: suites.into_iter().collect(),
+                trials,
+                jt9_trials,
+                noise_slots,
+                jobs: cli.jobs,
+                cliff_configs: cliff_configs.map(|v| v.into_iter().collect()),
+                max_wall_secs,
+                resume_cache: resume,
+            };
+            ft8_stage3::run_stage3_suites(
+                &wsjtx_root,
+                &rust_ftx_root,
+                &resolved_bin_dir,
+                &cache_dir,
+                &jt9,
+                &opts,
+                out.as_deref(),
+            )?;
+        }
     }
 
     Ok(())
@@ -430,6 +508,12 @@ fn main() -> ExitCode {
         Err(err) => {
             if let Some(scorecard::ScorecardError::CheckpointPaused { .. }) =
                 err.downcast_ref::<scorecard::ScorecardError>()
+            {
+                eprintln!("{err}");
+                return ExitCode::from(3);
+            }
+            if let Some(ft8_stage3::Stage3Error::CheckpointPaused { .. }) =
+                err.downcast_ref::<ft8_stage3::Stage3Error>()
             {
                 eprintln!("{err}");
                 return ExitCode::from(3);

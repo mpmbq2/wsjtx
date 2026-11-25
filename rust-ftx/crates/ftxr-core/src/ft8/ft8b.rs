@@ -2,8 +2,8 @@
 // Copyright (C) 2026 ftxr-modem Contributors
 // Based on WSJT-X algorithms (Copyright (C) 2001-2026 WSJT Development Group).
 
-//! FT8 symbol FFT, 1-symbol soft LLRs, and candidate decode (`ft8b.f90`,
-//! explicitly excluding unused Numerical Recipes `bessi0`).
+//! FT8 symbol FFT, multi-symbol coherent soft LLRs (`bmeta`–`bmete`), AP pass scheduling,
+//! and candidate decode (`wsjtx/lib/ft8/ft8b.f90`, explicitly excluding unused NR `bessi0`).
 
 use std::f32::consts::TAU;
 
@@ -19,7 +19,9 @@ use crate::protocol::hashtable::CallsignHashTable;
 use crate::protocol::types::{PendingHashUpdates, UnpackContext, UnpackMode, PAYLOAD_BITS};
 use crate::protocol::unpack77::unpack77_readonly;
 use crate::telemetry::FecMethod;
+use crate::{ApTag, QsoContext};
 
+use super::ap::{apply_ap_hypothesis, ft8b_pass_count, ft8b_pass_plan, ApSeed, Ft8bPassPlan};
 use super::params::{DOWN_NFFT2, GRAYMAP, ICOS7, ND, NDOWN, NN, NP2, SAMPLE_RATE_HZ};
 use super::sync8::{BitMetricMode, Ft8Candidate};
 use super::sync8d::Sync8dTables;
@@ -31,6 +33,9 @@ pub struct Ft8bScratch {
     pub fft32_scratch: Vec<Complex32>,
     pub cs: [[Complex32; 8]; NN],
     pub s8: [[f32; 8]; NN],
+    pub s2: [f32; 512],
+    pub llrz: [f32; LDPC_N],
+    pub apmask: [u8; LDPC_N],
     pub osd_scratch: OsdScratch,
 }
 
@@ -42,12 +47,33 @@ impl Ft8bScratch {
             fft32_scratch: vec![Complex32::ZERO; plans.c2c_fwd_32.get_inplace_scratch_len()],
             cs: [[Complex32::ZERO; 8]; NN],
             s8: [[0.0; 8]; NN],
+            s2: [0.0; 512],
+            llrz: [0.0; LDPC_N],
+            apmask: [0u8; LDPC_N],
             osd_scratch: OsdScratch::new(),
         }
     }
 }
 
-/// Intermediate fine-sync and soft-demodulation products exposed for Stage 2 verification.
+/// Complete multi-symbol coherent bit metrics (`bmeta`–`bmete`, `llra`–`llre`) for Stage 3
+/// decoding and intermediate verification.
+#[derive(Debug, Clone)]
+pub struct Ft8BitMetrics {
+    /// Unnormalized 1-symbol metrics.
+    pub bmeta: [f32; LDPC_N],
+    /// Unnormalized 2-symbol coherent metrics.
+    pub bmetb: [f32; LDPC_N],
+    /// Unnormalized 3-symbol coherent metrics.
+    pub bmetc: [f32; LDPC_N],
+    /// Unnormalized bit-by-bit ratio-normalized 1-symbol metrics.
+    pub bmetd: [f32; LDPC_N],
+    /// Unnormalized signed max-abs across `bmeta`, `bmetb`, `bmetc`.
+    pub bmete: [f32; LDPC_N],
+    /// Normalized & scaled (`* 2.83`) LLRs: `[llra, llrb, llrc, llrd, llre]`.
+    pub llrs: [[f32; LDPC_N]; 5],
+}
+
+/// Intermediate fine-sync and soft-demodulation products exposed for Stage 2/3 verification.
 #[derive(Debug, Clone)]
 pub struct Ft8bIntermediates {
     pub f1_refined_hz: f32,
@@ -73,6 +99,8 @@ pub struct Ft8bOutcome {
     pub nhard_errors: i32,
     pub dmin: f32,
     pub qual: f32,
+    pub iaptype: u8,
+    pub ap_tag: ApTag,
     pub fec_method: FecMethod,
     pub message: String,
     pub i3: u8,
@@ -135,6 +163,130 @@ pub fn compute_1sym_bmet_pair(
     }
 
     (bmeta, bmetd)
+}
+
+/// Computes all 5 Stage 3 coherent multi-symbol bit-metric sets (`bmeta`–`bmete`, `llra`–`llre`)
+/// matching `wsjtx/lib/ft8/ft8b.f90:186-254`, including exact half-boundary Costas symbol
+/// overlap (`cs[36]` and `cs[72]`).
+pub fn compute_all_bit_metrics(
+    cs: &[[Complex32; 8]; NN],
+    metric_mode: BitMetricMode,
+    s2: &mut [f32; 512],
+) -> Ft8BitMetrics {
+    let mut bmeta = [0.0_f32; LDPC_N];
+    let mut bmetb = [0.0_f32; LDPC_N];
+    let mut bmetc = [0.0_f32; LDPC_N];
+    let mut bmetd = [0.0_f32; LDPC_N];
+    let mut bmete = [0.0_f32; LDPC_N];
+    let power = metric_mode == BitMetricMode::Power;
+
+    for nsym in 1..=3 {
+        let nt = 1usize << (3 * nsym);
+        let ibmax = 3 * nsym - 1;
+        for ihalf in 0..2 {
+            let mut k = 0usize;
+            while k < 29 {
+                let ks = if ihalf == 0 { k + 7 } else { k + 43 };
+                match nsym {
+                    1 => {
+                        for i3 in 0..8 {
+                            let mag = cs[ks][GRAYMAP[i3] as usize].norm();
+                            s2[i3] = if power { mag * mag } else { mag };
+                        }
+                    }
+                    2 => {
+                        for i2 in 0..8 {
+                            let z1 = cs[ks][GRAYMAP[i2] as usize];
+                            let row = i2 << 3;
+                            for i3 in 0..8 {
+                                let mag = (z1 + cs[ks + 1][GRAYMAP[i3] as usize]).norm();
+                                s2[row | i3] = if power { mag * mag } else { mag };
+                            }
+                        }
+                    }
+                    _ => {
+                        for i1 in 0..8 {
+                            let z1 = cs[ks][GRAYMAP[i1] as usize];
+                            let blk = i1 << 6;
+                            for i2 in 0..8 {
+                                let z12 = z1 + cs[ks + 1][GRAYMAP[i2] as usize];
+                                let row = blk | (i2 << 3);
+                                for i3 in 0..8 {
+                                    let mag = (z12 + cs[ks + 2][GRAYMAP[i3] as usize]).norm();
+                                    s2[row | i3] = if power { mag * mag } else { mag };
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let i32_base = k * 3 + ihalf * 87;
+                for ib in 0..=ibmax {
+                    let bit_idx = i32_base + ib;
+                    if bit_idx >= LDPC_N {
+                        continue;
+                    }
+                    let bit_pos = ibmax - ib;
+                    let mut m1 = f32::NEG_INFINITY;
+                    let mut m0 = f32::NEG_INFINITY;
+                    for (i, &val) in s2[..nt].iter().enumerate() {
+                        if ((i >> bit_pos) & 1) != 0 {
+                            if val > m1 {
+                                m1 = val;
+                            }
+                        } else if val > m0 {
+                            m0 = val;
+                        }
+                    }
+                    let bm = m1 - m0;
+                    match nsym {
+                        1 => {
+                            bmeta[bit_idx] = bm;
+                            let den = m1.max(m0);
+                            bmetd[bit_idx] = if den > 0.0 { bm / den } else { 0.0 };
+                        }
+                        2 => bmetb[bit_idx] = bm,
+                        _ => bmetc[bit_idx] = bm,
+                    }
+                }
+
+                k += nsym;
+            }
+        }
+    }
+
+    for i in 0..LDPC_N {
+        let candidates = [bmeta[i], bmetb[i], bmetc[i]];
+        let mut best_val = candidates[0];
+        let mut best_abs = best_val.abs();
+        for &v in &candidates[1..] {
+            let av = v.abs();
+            if av > best_abs {
+                best_abs = av;
+                best_val = v;
+            }
+        }
+        bmete[i] = best_val;
+    }
+
+    const SCALEFAC: f32 = 2.83;
+    let raw_sets = [bmeta, bmetb, bmetc, bmetd, bmete];
+    let mut llrs = [[0.0_f32; LDPC_N]; 5];
+    for (dst, mut src) in llrs.iter_mut().zip(raw_sets) {
+        normalize_bmet(&mut src);
+        for (d, &s) in dst.iter_mut().zip(src.iter()) {
+            *d = SCALEFAC * s;
+        }
+    }
+
+    Ft8BitMetrics {
+        bmeta,
+        bmetb,
+        bmetc,
+        bmetd,
+        bmete,
+        llrs,
+    }
 }
 
 /// Port of `normalizebmet` (`wsjtx/lib/ft8/ft8b.f90:493-506`) with zero-variance guard.
@@ -254,7 +406,7 @@ pub fn ft8b_extract_stage2_intermediates(
         }
     }
 
-    // Hard Costas sync count (maxloc lowest-index tie-breaking matches Fortran maxloc).
+    // Hard Costas sync count (lowest-index tie-breaking matches Fortran `maxloc`).
     let mut nsync = 0u8;
     for (k, &expected_tone) in ICOS7.iter().enumerate() {
         for base in [0usize, 36, 72] {
@@ -306,18 +458,23 @@ pub fn ft8b_extract_stage2_intermediates(
     })
 }
 
-/// Decodes a single candidate from immutable `snapshot` (does NOT mutate `dd` or `hash_table`).
+/// Decodes a single candidate with full Stage 3 multi-symbol coherent LLRs (`llra`–`llre`),
+/// hybrid BP+OSD (`maxosd = 2` for `depth >= 2`), and single-slot AP (`a1`–`a6`).
 ///
-/// Caller performs deterministic hash-table commit and signal subtraction when `Some` is returned.
+/// Does NOT mutate `dd` or `hash_table`; caller performs deterministic hash-table commit
+/// and signal subtraction when `Some` is returned.
 #[allow(clippy::too_many_arguments)]
-pub fn ft8b_decode_candidate(
+pub fn ft8b_decode_candidate_with_ap(
     snapshot: &Ft8SpectrumSnapshot,
     cand: &Ft8Candidate,
     xbase: f32,
     depth: u8,
+    nzhsym: u8,
     metric_mode: BitMetricMode,
     nagain: bool,
     ncontest: u8,
+    qso: Option<&QsoContext>,
+    ap_seed: &ApSeed,
     plans: &Ft8FftPlans,
     downsampler: &Ft8Downsampler,
     sync8d_tables: &Sync8dTables,
@@ -336,15 +493,60 @@ pub fn ft8b_decode_candidate(
         scratch,
     )?;
 
-    let apmask = [0u8; LDPC_N];
-    let try_decode_llr = |llr: &[f32; LDPC_N], osd_scratch: &mut OsdScratch| {
-        // Stage 2: BP-only (`maxosd = -1`); Stage 3 enables OSD + multi-symbol coherent LLRs + AP.
-        let decoded = decode174_91(llr, 91, -1, 2, &apmask, osd_scratch)?;
+    let metrics = compute_all_bit_metrics(&scratch.cs, metric_mode, &mut scratch.s2);
+    let npasses = ft8b_pass_count(qso, nzhsym);
+    let maxosd: i32 = if depth <= 1 { -1 } else { 2 };
+    let norder: u8 = 2;
+
+    let mut hit = None;
+    for ipass in 1..=npasses {
+        let iaptype: u8 = match ft8b_pass_plan(ipass, qso) {
+            Ft8bPassPlan::NonAp { metric_idx } => {
+                scratch.apmask.fill(0);
+                scratch.llrz = metrics.llrs[metric_idx];
+                0
+            }
+            Ft8bPassPlan::Ap {
+                iaptype,
+                use_llrc,
+            } => {
+                let Some(ctx) = qso else { continue };
+                let base_llr = if use_llrc {
+                    &metrics.llrs[2]
+                } else {
+                    &metrics.llrs[0]
+                };
+                if !apply_ap_hypothesis(
+                    iaptype,
+                    ctx,
+                    ap_seed,
+                    inter.f1_refined_hz,
+                    base_llr,
+                    &mut scratch.llrz,
+                    &mut scratch.apmask,
+                ) {
+                    continue;
+                }
+                iaptype
+            }
+        };
+
+        let Some(decoded) = decode174_91(
+            &scratch.llrz,
+            91,
+            maxosd,
+            norder,
+            &scratch.apmask,
+            &mut scratch.osd_scratch,
+        ) else {
+            continue;
+        };
+
         if decoded.nhard_errors < 0 || decoded.nhard_errors > 36 {
-            return None;
+            continue;
         }
         if decoded.codeword.iter().all(|&b| b == 0) {
-            return None;
+            continue;
         }
 
         let mut message77 = [0u8; PAYLOAD_BITS];
@@ -353,32 +555,25 @@ pub fn ft8b_decode_candidate(
         let n3 = (message77[71] << 2) | (message77[72] << 1) | message77[73];
         let i3 = (message77[74] << 2) | (message77[75] << 1) | message77[76];
         if i3 > 5 || (i3 == 0 && (n3 > 6 || n3 == 2)) {
-            return None;
+            continue;
         }
 
-        let unpacked = unpack77_readonly(&message77, UnpackMode::Rx, unpack_ctx, hash_table).ok()?;
+        let Ok(unpacked) = unpack77_readonly(&message77, UnpackMode::Rx, unpack_ctx, hash_table)
+        else {
+            continue;
+        };
         if ncontest == 0
             && (1..=3).contains(&i3)
             && (unpacked.text.contains("/R") || unpacked.text.starts_with("TU; "))
         {
-            return None;
+            continue;
         }
 
-        Some((decoded, message77, i3, n3, unpacked))
-    };
+        hit = Some((decoded, message77, i3, n3, unpacked, iaptype));
+        break;
+    }
 
-    let (decoded, message77, i3, n3, unpacked) =
-        if let Some(hit) = try_decode_llr(&inter.llra, &mut scratch.osd_scratch) {
-            hit
-        } else {
-            let mut bmetd = compute_1sym_bmetd(&scratch.cs, metric_mode);
-            normalize_bmet(&mut bmetd);
-            for x in &mut bmetd {
-                *x *= 2.83;
-            }
-            try_decode_llr(&bmetd, &mut scratch.osd_scratch)?
-        };
-
+    let (decoded, message77, i3, n3, unpacked, iaptype) = hit?;
     let itone = encode_ft8_tones_from_77bits(&message77);
 
     let mut xsig = 0.0_f32;
@@ -409,6 +604,7 @@ pub fn ft8b_decode_candidate(
     }
 
     let qual = 1.0 - (decoded.nhard_errors as f32 + decoded.dmin) / 60.0;
+    let ap_tag = ApTag::from_wsjtx(iaptype, qual);
 
     Some(Ft8bOutcome {
         freq_hz: inter.f1_refined_hz,
@@ -419,6 +615,8 @@ pub fn ft8b_decode_candidate(
         nhard_errors: decoded.nhard_errors,
         dmin: decoded.dmin,
         qual,
+        iaptype,
+        ap_tag,
         fec_method: decoded.fec_method,
         message: unpacked.text,
         i3,
@@ -426,6 +624,44 @@ pub fn ft8b_decode_candidate(
         itone,
         pending_hashes: unpacked.pending_hashes,
     })
+}
+
+/// Convenience wrapper for decoding a single candidate without AP context.
+#[allow(clippy::too_many_arguments)]
+pub fn ft8b_decode_candidate(
+    snapshot: &Ft8SpectrumSnapshot,
+    cand: &Ft8Candidate,
+    xbase: f32,
+    depth: u8,
+    metric_mode: BitMetricMode,
+    nagain: bool,
+    ncontest: u8,
+    plans: &Ft8FftPlans,
+    downsampler: &Ft8Downsampler,
+    sync8d_tables: &Sync8dTables,
+    unpack_ctx: &UnpackContext,
+    hash_table: &CallsignHashTable,
+    scratch: &mut Ft8bScratch,
+) -> Option<Ft8bOutcome> {
+    let default_seed = ApSeed::default();
+    ft8b_decode_candidate_with_ap(
+        snapshot,
+        cand,
+        xbase,
+        depth,
+        50,
+        metric_mode,
+        nagain,
+        ncontest,
+        None,
+        &default_seed,
+        plans,
+        downsampler,
+        sync8d_tables,
+        unpack_ctx,
+        hash_table,
+        scratch,
+    )
 }
 
 #[cfg(test)]
@@ -446,7 +682,6 @@ mod tests {
         let tones = encode_ft8_tones_from_77bits(&packed.bits);
         let wave = gen_ft8_wave_real(&tones, 1500.0, 12_000);
 
-        // Place active waveform at 0.5 s (6000 samples) with amplitude 1000.0.
         let mut dd: Box<[f32; NMAX]> = vec![0.0_f32; NMAX].into_boxed_slice().try_into().unwrap();
         for (i, &w) in wave.iter().enumerate() {
             dd[6000 + i] = w * 1000.0;
@@ -487,8 +722,49 @@ mod tests {
         assert_eq!(outcome.message, msg);
         assert_eq!(outcome.nhard_errors, 0);
         assert_eq!(outcome.nsync_hard, 21);
+        assert_eq!(outcome.ap_tag, ApTag::None);
         assert!((outcome.freq_hz - 1500.0).abs() < 1.0);
         assert!((outcome.dt_raw_sec - 0.5).abs() < 0.02);
+    }
+
+    #[test]
+    fn compute_all_bit_metrics_populates_coherent_llrs_without_nans() {
+        let ht = CallsignHashTable::new();
+        let ctx = UnpackContext::default();
+        let packed = pack77("N0AAA K9BBB RR73", None, &ctx, &ht).unwrap();
+        let tones = encode_ft8_tones_from_77bits(&packed.bits);
+        let wave = gen_ft8_wave_real(&tones, 1500.0, 12_000);
+        let mut dd: Box<[f32; NMAX]> = vec![0.0_f32; NMAX].into_boxed_slice().try_into().unwrap();
+        for (i, &w) in wave.iter().enumerate() {
+            dd[6000 + i] = w * 1000.0;
+        }
+
+        let plans = Ft8FftPlans::new();
+        let downsampler = Ft8Downsampler::new();
+        let sync8d_tables = Sync8dTables::new();
+        let mut sync_scratch = Sync8Scratch::new(&plans);
+        let cands = sync8(&dd, 200.0, 4000.0, 2.1, 1500.0, 1000, &plans, &mut sync_scratch);
+        let mut snap_scratch = DownsampleSnapshotScratch::new(&plans);
+        let mut snapshot = Ft8SpectrumSnapshot::new();
+        downsampler.compute_snapshot(&dd, &plans, &mut snap_scratch, &mut snapshot);
+        let mut scratch = Ft8bScratch::new(&plans);
+        let _inter = ft8b_extract_stage2_intermediates(
+            &snapshot,
+            &cands[0],
+            3,
+            BitMetricMode::Power,
+            &plans,
+            &downsampler,
+            &sync8d_tables,
+            &mut scratch,
+        )
+        .unwrap();
+
+        let m = compute_all_bit_metrics(&scratch.cs, BitMetricMode::Power, &mut scratch.s2);
+        for set in &m.llrs {
+            assert!(set.iter().all(|v| v.is_finite()));
+            assert!(set.iter().any(|&v| v.abs() > 1.0));
+        }
     }
 
     #[test]

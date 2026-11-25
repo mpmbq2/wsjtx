@@ -7,3 +7,7 @@
 pub mod bp;
 pub mod decode174_91;
 pub mod osd;
+
+pub use bp::{BpDecodeOutput, LdpcDecoded, LDPC_K, LDPC_M, LDPC_N};
+pub use decode174_91::decode174_91;
+pub use osd::{osd174_91, OsdResult, OsdScratch};
