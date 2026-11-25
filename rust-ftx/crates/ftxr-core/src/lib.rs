@@ -311,20 +311,29 @@ pub enum FtxrError {
     Internal(String),
 }
 
-/// Stateful, thread-safe FT8/FT4 modem engine (stub in Stage 0; populated across Stages 1–5).
+/// Stateful, thread-safe FT8/FT4 modem engine (TX implemented in Stage 1; RX in Stages 2–5).
 #[derive(Debug, Default)]
 pub struct DecoderEngine {
-    _private: (),
+    hash_table: protocol::hashtable::CallsignHashTable,
 }
 
 impl DecoderEngine {
     /// Creates a new modem engine instance with an empty session callsign hash table.
     pub fn new() -> Self {
-        Self { _private: () }
+        Self {
+            hash_table: protocol::hashtable::CallsignHashTable::new(),
+        }
+    }
+
+    /// Returns a reference to the session-scoped callsign hash table.
+    pub fn hash_table(&self) -> &protocol::hashtable::CallsignHashTable {
+        &self.hash_table
     }
 
     /// Clears session-scoped state (callsign hash tables) between bands or operating sessions.
-    pub fn reset_session(&mut self) {}
+    pub fn reset_session(&mut self) {
+        self.hash_table.clear();
+    }
 
     /// Decodes a 12 kHz mono baseband PCM buffer for the configured mode.
     pub fn decode(
@@ -355,12 +364,12 @@ impl DecoderEngine {
     /// Encodes and GFSK-modulates an FT8 or FT4 message into mono `f32` PCM samples.
     pub fn modulate(
         &mut self,
-        _message: &str,
-        _cfg: &ModulateConfig,
+        message: &str,
+        cfg: &ModulateConfig,
     ) -> Result<Vec<f32>, FtxrError> {
-        Err(FtxrError::Unimplemented(
-            "DecoderEngine::modulate (Stage 1)",
-        ))
+        let ctx = protocol::types::UnpackContext::default();
+        let wave = modulate::modulate_message(message, cfg, &ctx, &self.hash_table)?;
+        Ok(wave.samples)
     }
 }
 
@@ -482,7 +491,7 @@ mod tests {
     }
 
     #[test]
-    fn stub_engine_returns_unimplemented() {
+    fn stub_decode_returns_unimplemented_and_modulate_succeeds() {
         let mut engine = DecoderEngine::new();
         let cfg = DecodeConfig::for_mode(Mode::Ft8);
         assert!(matches!(
@@ -490,9 +499,7 @@ mod tests {
             Err(FtxrError::Unimplemented(_))
         ));
         let mcfg = ModulateConfig::default_for(Mode::Ft8, 1500.0, 12_000);
-        assert!(matches!(
-            engine.modulate("CQ N0AAA EM10", &mcfg),
-            Err(FtxrError::Unimplemented(_))
-        ));
+        let pcm = engine.modulate("CQ N0AAA EM10", &mcfg).unwrap();
+        assert_eq!(pcm.len(), 6_000 + 151_680);
     }
 }

@@ -6,12 +6,14 @@
 //!
 //! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`.
 
+mod codec_oracle;
 mod corpus;
 mod jt9;
 mod scorecard;
 mod sim;
 mod smoke;
 mod synth;
+mod tx_loopback;
 mod wav;
 
 use std::fs;
@@ -186,6 +188,26 @@ enum Commands {
         #[arg(long)]
         exact: bool,
     },
+
+    /// Differential fuzzing and golden-table verification of Rust 77-bit/FEC/tones vs ft8code/ft4code.
+    CodecDiff {
+        /// Deterministic PRNG seed.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Number of fuzzed messages per mode (FT8 and FT4).
+        #[arg(long, default_value_t = 5000)]
+        count: usize,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Waveform numerical diff (ft8sim/ft4sim) and TX-to-jt9 loopback verification suite.
+    TxLoopback {
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn default_rust_ftx_root() -> PathBuf {
@@ -334,6 +356,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 min_decode_ratio,
                 exact,
             )?;
+        }
+        Commands::CodecDiff { seed, count, out } => {
+            let sim = SimRunner::new(bin_dir, cache_dir);
+            codec_oracle::run_codec_diff(&sim, seed, count, out.as_deref())?;
+        }
+        Commands::TxLoopback { out } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let jt9 = Jt9Runner::new(sim.bin_path("jt9").parent().unwrap().to_path_buf(), cache_dir);
+            tx_loopback::run_tx_loopback(&wsjtx_root, &sim, &jt9, out.as_deref())?;
         }
     }
 

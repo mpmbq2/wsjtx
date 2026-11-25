@@ -579,9 +579,23 @@ impl Jt9Runner {
         cfg: &Jt9RunConfig,
         wisdom_path: Option<&Path>,
     ) -> Result<Jt9RunOutput, Jt9Error> {
+        self.run_wavs(&[wav_path], cfg, wisdom_path)
+    }
+
+    /// Runs a single isolated `jt9` subprocess sequentially over multiple WAV files
+    /// (preserving in-process hash-table state across files).
+    pub fn run_wavs(
+        &self,
+        wav_paths: &[&Path],
+        cfg: &Jt9RunConfig,
+        wisdom_path: Option<&Path>,
+    ) -> Result<Jt9RunOutput, Jt9Error> {
         let jt9_bin = self.jt9_path();
         if !jt9_bin.exists() {
             return Err(Jt9Error::BinaryMissing(jt9_bin));
+        }
+        if wav_paths.is_empty() {
+            return Err(Jt9Error::InvalidConfig("empty wav_paths".into()));
         }
 
         let tmp = tempfile::tempdir()?;
@@ -596,26 +610,29 @@ impl Jt9Runner {
             }
         }
 
-        // Guard against Release `-fbounds-check` crashes on short filenames (<6 digits before `.wav`).
-        let effective_wav = if wav::is_jt9_safe_filename(wav_path) {
-            wav_path.to_path_buf()
-        } else {
-            let safe_link = tmp.path().join("000000_000001.wav");
-            let abs = fs::canonicalize(wav_path)?;
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&abs, &safe_link)?;
-            #[cfg(not(unix))]
-            fs::copy(&abs, &safe_link)?;
-            safe_link
-        };
-
         let mut args = cfg.base_args()?;
         args.push("-a".to_string());
         args.push(data_dir.display().to_string());
         args.push("-t".to_string());
         args.push(temp_dir.display().to_string());
-        args.push(effective_wav.display().to_string());
 
+        for (idx, wav_path) in wav_paths.iter().enumerate() {
+            // Guard against Release `-fbounds-check` crashes on short filenames (<6 digits before `.wav`).
+            let effective_wav = if wav::is_jt9_safe_filename(wav_path) {
+                wav_path.to_path_buf()
+            } else {
+                let safe_link = tmp.path().join(format!("000000_{:06}.wav", idx + 1));
+                let abs = fs::canonicalize(wav_path)?;
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&abs, &safe_link)?;
+                #[cfg(not(unix))]
+                fs::copy(&abs, &safe_link)?;
+                safe_link
+            };
+            args.push(effective_wav.display().to_string());
+        }
+
+        let wav_label = wav_paths[0].display().to_string();
         let started = Instant::now();
         let mut child = Command::new(&jt9_bin)
             .env("OMP_NUM_THREADS", "1")
@@ -634,7 +651,7 @@ impl Jt9Runner {
                         let _ = child.kill();
                         let _ = child.wait();
                         return Err(Jt9Error::Timeout {
-                            wav: wav_path.display().to_string(),
+                            wav: wav_label,
                             timeout_secs: cfg.timeout_secs,
                         });
                     }
@@ -649,7 +666,7 @@ impl Jt9Runner {
 
         if !output.status.success() {
             return Err(Jt9Error::NonZeroExit {
-                wav: wav_path.display().to_string(),
+                wav: wav_label,
                 status: output.status.code(),
                 stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
             });
@@ -658,11 +675,11 @@ impl Jt9Runner {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parsed = parse_jt9_stdout(&stdout);
         let finished = parsed.finished.ok_or_else(|| Jt9Error::MissingDecodeFinished {
-            wav: wav_path.display().to_string(),
+            wav: wav_label.clone(),
         })?;
 
         Ok(Jt9RunOutput {
-            wav_path: wav_path.display().to_string(),
+            wav_path: wav_label,
             cli_args: args,
             elapsed_ms,
             decodes: parsed.decodes,

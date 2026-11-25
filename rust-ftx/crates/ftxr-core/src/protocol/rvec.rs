@@ -22,6 +22,18 @@ pub fn xor_rvec(bits: &[u8; 77]) -> [u8; 77] {
     out
 }
 
+/// Scrambles a 77-bit FT4 payload with `FT4_RVEC` prior to CRC-14 / LDPC(174,91) encoding.
+#[inline]
+pub fn scramble_ft4(msg77: &[u8; 77]) -> [u8; 77] {
+    xor_rvec(msg77)
+}
+
+/// Descrambles a 77-bit FT4 payload with `FT4_RVEC` after LDPC/CRC verification.
+#[inline]
+pub fn descramble_ft4(scrambled77: &[u8; 77]) -> [u8; 77] {
+    xor_rvec(scrambled77)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
