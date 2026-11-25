@@ -1,0 +1,13 @@
+[package]
+name = "ftxr-core"
+description = "Pure-Rust FT8 and FT4 modem core library (encoder, GFSK modulator, and weak-signal decoder) based on WSJT-X algorithms"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true

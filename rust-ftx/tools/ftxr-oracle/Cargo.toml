@@ -1,0 +1,25 @@
+[package]
+name = "ftxr-oracle"
+description = "Development-only WSJT-X oracle test, deterministic synthetic corpus generator, and baseline benchmark harness (stays in wsjtx)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "ftxr-oracle"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+ftxr-core.workspace = true
+rand_chacha.workspace = true
+rand_core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true

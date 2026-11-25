@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ftxr-core",
+    "crates/ftxr-modem",
+    "tools/ftxr-oracle",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-only"
+repository = "https://github.com/mpmbq2/ftxr-modem"
+authors = ["ftxr-modem Contributors"]
+
+[workspace.dependencies]
+ftxr-core = { path = "crates/ftxr-core", version = "0.1.0" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+rand_chacha = "0.3"
+rand_core = "0.6"
+sha2 = "0.10"
+tempfile = "3"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }

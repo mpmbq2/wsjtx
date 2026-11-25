@@ -1,0 +1,9 @@
+/target/
+/.oracle-build/
+/.oracle-cache/
+000000_*.wav
+!fixtures/committed/**/*.wav
+jt9_wisdom.dat
+timer.out
+decoded.txt
+*.tmp

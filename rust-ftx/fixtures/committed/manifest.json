@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "fixtures": [
+    {
+      "fixture_id": "wsjtx_sample_ft8_210703_133430",
+      "category": "committed_real",
+      "mode": "ft8",
+      "relative_path": "../samples/FT8/210703_133430.wav",
+      "sha256": "9feb99c275770a6618538026da7decc6b09eb6cf63121e5168fa86dcdf00c2f5",
+      "size_bytes": 360246,
+      "samples": 180000,
+      "description": "Real crowded HF off-air FT8 recording from WSJT-X samples (GPLv3)"
+    },
+    {
+      "fixture_id": "wsjtx_sample_ft4_000002",
+      "category": "committed_real",
+      "mode": "ft4",
+      "relative_path": "../samples/FT4/000000_000002.wav",
+      "sha256": "d9e91fa04ba138a7b9f41b4103823c77ca1c3a9775101f6b14d60935bcd3813b",
+      "size_bytes": 145196,
+      "samples": 72576,
+      "description": "Real/reference multi-signal FT4 recording from WSJT-X samples (GPLv3)"
+    },
+    {
+      "fixture_id": "digidx_fixture_ft8_191111_110200",
+      "category": "committed_real",
+      "mode": "ft8",
+      "relative_path": "fixtures/committed/ft8/191111_110200.wav",
+      "sha256": "bfd0bd61ac22b6d19a861039023fdf8e17397ae084277e63174b3ab3773c4022",
+      "size_bytes": 360202,
+      "samples": 180000,
+      "description": "Real HF FT8 reference fixture (5 known decodes; originally kgoba/ft8_lib MIT)",
+      "reference_txt_path": "fixtures/committed/ft8/191111_110200.txt"
+    },
+    {
+      "fixture_id": "ft8_crowded_20db",
+      "category": "committed_reg",
+      "mode": "ft8",
+      "relative_path": "fixtures/committed/ft8/000000_000101.wav",
+      "sha256": "9e37c8ee2d6177c9a5992d78d2e4739e480d8ecd76c23069ae7a145731097c14",
+      "size_bytes": 360044,
+      "samples": 180000,
+      "description": "Deterministic 10-signal FT8 slot spanning +2 to -18 dB (20 dB dynamic range)",
+      "ground_truth": [
+        {
+          "message": "CQ N0AAA EM10",
+          "af_hz": 620.0,
+          "dt_sec": 0.1,
+          "snr_db": 2.0
+        },
+        {
+          "message": "K9BBB AA1AA -04",
+          "af_hz": 690.0,
+          "dt_sec": -0.2,
+          "snr_db": -16.0
+        },
+        {
+          "message": "CQ DX BB2BB FN20",
+          "af_hz": 940.0,
+          "dt_sec": 0.3,
+          "snr_db": -3.0
+        },
+        {
+          "message": "VE3CCC DL4DDD R-11",
+          "af_hz": 1010.0,
+          "dt_sec": 0.0,
+          "snr_db": -18.0
+        },
+        {
+          "message": "JA5EEE VK6FFF RR73",
+          "af_hz": 1320.0,
+          "dt_sec": -0.3,
+          "snr_db": 0.0
+        },
+        {
+          "message": "CQ G7GGG IO91",
+          "af_hz": 1385.0,
+          "dt_sec": 0.2,
+          "snr_db": -14.0
+        },
+        {
+          "message": "F8HHH EA9III 73",
+          "af_hz": 1750.0,
+          "dt_sec": 0.4,
+          "snr_db": -8.0
+        },
+        {
+          "message": "PY0JJJ N0AAA -12",
+          "af_hz": 1815.0,
+          "dt_sec": -0.1,
+          "snr_db": -17.0
+        },
+        {
+          "message": "CQ K9BBB DM79",
+          "af_hz": 2210.0,
+          "dt_sec": 0.0,
+          "snr_db": -6.0
+        },
+        {
+          "message": "AA1AA VE3CCC RRR",
+          "af_hz": 2280.0,
+          "dt_sec": 0.5,
+          "snr_db": -12.0
+        }
+      ]
+    },
+    {
+      "fixture_id": "ft8_fading_mm",
+      "category": "committed_reg",
+      "mode": "ft8",
+      "relative_path": "fixtures/committed/ft8/000000_000102.wav",
+      "sha256": "97b5c843205e460531d8bcf7efb711d2ccae357b1875bfc2ccfb3b3c9c045d43",
+      "size_bytes": 360044,
+      "samples": 180000,
+      "description": "Frozen Watterson Mid-Latitude Moderate fading FT8 slot (fspread=1.0 Hz, delay=1.0 ms, -10 dB)",
+      "ground_truth": [
+        {
+          "message": "CQ N0AAA EM10",
+          "af_hz": 1500.0,
+          "dt_sec": 0.0,
+          "snr_db": -10.0
+        }
+      ]
+    },
+    {
+      "fixture_id": "ft8_late_tx_5s",
+      "category": "committed_reg",
+      "mode": "ft8",
+      "relative_path": "fixtures/committed/ft8/000000_000103.wav",
+      "sha256": "cc82c4e30968724b205490cd22757cffa872fa065a6887d779fe2ead2fb097c0",
+      "size_bytes": 360044,
+      "samples": 180000,
+      "description": "Deterministic +5.0 s UTC-aligned late-start FT8 slot at -5 dB",
+      "ground_truth": [
+        {
+          "message": "CQ N0AAA EM10",
+          "af_hz": 1500.0,
+          "dt_sec": 0.0,
+          "snr_db": -5.0,
+          "late_start_ms": 5000
+        }
+      ]
+    },
+    {
+      "fixture_id": "ft4_crowded_20db",
+      "category": "committed_reg",
+      "mode": "ft4",
+      "relative_path": "fixtures/committed/ft4/000000_000201.wav",
+      "sha256": "89fb337ead2c15e813f88ebb8e867623c8d852a72cdc8b33cadc768acc7786d1",
+      "size_bytes": 145196,
+      "samples": 72576,
+      "description": "Deterministic 10-signal FT4 slot spanning +2 to -18 dB (20 dB dynamic range)",
+      "ground_truth": [
+        {
+          "message": "CQ N0AAA EM10",
+          "af_hz": 450.0,
+          "dt_sec": 0.05,
+          "snr_db": 2.0
+        },
+        {
+          "message": "K9BBB AA1AA -05",
+          "af_hz": 560.0,
+          "dt_sec": -0.1,
+          "snr_db": -14.0
+        },
+        {
+          "message": "CQ DX BB2BB FN20",
+          "af_hz": 820.0,
+          "dt_sec": 0.15,
+          "snr_db": -2.0
+        },
+        {
+          "message": "VE3CCC DL4DDD R-11",
+          "af_hz": 940.0,
+          "dt_sec": 0.0,
+          "snr_db": -18.0
+        },
+        {
+          "message": "JA5EEE VK6FFF RR73",
+          "af_hz": 1260.0,
+          "dt_sec": -0.15,
+          "snr_db": 0.0
+        },
+        {
+          "message": "CQ G7GGG IO91",
+          "af_hz": 1380.0,
+          "dt_sec": 0.1,
+          "snr_db": -13.0
+        },
+        {
+          "message": "F8HHH EA9III 73",
+          "af_hz": 1740.0,
+          "dt_sec": 0.2,
+          "snr_db": -7.0
+        },
+        {
+          "message": "PY0JJJ N0AAA -10",
+          "af_hz": 1860.0,
+          "dt_sec": -0.05,
+          "snr_db": -16.0
+        },
+        {
+          "message": "CQ K9BBB DM79",
+          "af_hz": 2300.0,
+          "dt_sec": 0.0,
+          "snr_db": -5.0
+        },
+        {
+          "message": "AA1AA VE3CCC RRR",
+          "af_hz": 2420.0,
+          "dt_sec": 0.1,
+          "snr_db": -11.0
+        }
+      ]
+    }
+  ]
+}
