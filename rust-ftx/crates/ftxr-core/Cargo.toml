@@ -11,5 +11,7 @@ authors.workspace = true
 [dependencies]
 libm.workspace = true
 num-complex.workspace = true
+realfft.workspace = true
+rustfft.workspace = true
 serde.workspace = true
 thiserror.workspace = true

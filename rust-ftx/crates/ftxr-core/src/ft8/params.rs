@@ -32,6 +32,16 @@ pub const NSTEP: usize = NSPS / 4;
 pub const NHSYM: usize = NMAX / NSTEP - 3;
 /// Baseband downsample factor (`1920 / 32 = 60`, giving `200 Hz` sample rate).
 pub const NDOWN: usize = 60;
+/// Long real-to-complex FFT length in `ft8_downsample` (`df = 0.0625 Hz`).
+pub const DOWN_NFFT1: usize = 192_000;
+/// Baseband complex IFFT length in `ft8_downsample` (`192000 / 60 = 3200`).
+pub const DOWN_NFFT2: usize = DOWN_NFFT1 / NDOWN;
+/// Valid non-tail baseband sample count in `sync8d` and `ft8b` (`14.06 s` at `200 Hz`).
+pub const NP2: usize = 2_812;
+/// Subtraction FFT length (`NMAX = 180,000`).
+pub const SUB_NFFT: usize = NMAX;
+/// Subtraction `cos^2` low-pass filter span (`-2000..=+2000`, `4001` taps).
+pub const SUB_NFILT: usize = 4_000;
 /// GFSK Gaussian filter bandwidth-symbol-time product (`BT`).
 pub const BT: f32 = 2.0;
 /// Nominal TX start delay from UTC slot boundary (ms), matching `Modulator.cpp`.

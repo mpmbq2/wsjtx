@@ -28,3 +28,5 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 libm = "0.2"
 num-complex = { version = "0.4", default-features = false, features = ["std"] }
 rand = "0.8"
+realfft = "3"
+rustfft = "6"

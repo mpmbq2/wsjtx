@@ -4,14 +4,16 @@
 
 //! Development-only WSJT-X oracle harness (`ftxr-oracle`).
 //!
-//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`.
+//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`.
 
 mod codec_oracle;
 mod corpus;
+mod ft8_mvp_bench;
 mod jt9;
 mod scorecard;
 mod sim;
 mod smoke;
+mod stage2_verify;
 mod synth;
 mod tx_loopback;
 mod wav;
@@ -208,6 +210,27 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+    /// Stage 2 stage-by-stage Fortran numerical verification (ft8_stage_dump vs ftxr-core).
+    Stage2Verify {
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+    /// Stage 2 end-to-end FT8 decoder MVP benchmark and gate verification.
+    Ft8MvpBench {
+        /// AWGN trials per SNR for Rust decoder (0..-18 dB).
+        #[arg(long, default_value_t = 50)]
+        trials: usize,
+        /// AWGN trials per SNR for jt9 oracle cross-check.
+        #[arg(long, default_value_t = 10)]
+        jt9_trials: usize,
+        /// Number of pure-AWGN noise slots for false-positive check.
+        #[arg(long, default_value_t = 100)]
+        noise_slots: usize,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn default_rust_ftx_root() -> PathBuf {
@@ -365,6 +388,35 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let sim = SimRunner::new(bin_dir, cache_dir.clone());
             let jt9 = Jt9Runner::new(sim.bin_path("jt9").parent().unwrap().to_path_buf(), cache_dir);
             tx_loopback::run_tx_loopback(&wsjtx_root, &sim, &jt9, out.as_deref())?;
+        }
+        Commands::Stage2Verify { out } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let resolved_bin_dir = sim.bin_path("jt9").parent().unwrap().to_path_buf();
+            stage2_verify::run_stage2_verify(
+                &wsjtx_root,
+                &rust_ftx_root,
+                &resolved_bin_dir,
+                &cache_dir,
+                out.as_deref(),
+            )?;
+        }
+        Commands::Ft8MvpBench {
+            trials,
+            jt9_trials,
+            noise_slots,
+            out,
+        } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let jt9 = Jt9Runner::new(sim.bin_path("jt9").parent().unwrap().to_path_buf(), cache_dir);
+            ft8_mvp_bench::run_ft8_mvp_bench(
+                &wsjtx_root,
+                &rust_ftx_root,
+                &jt9,
+                trials,
+                jt9_trials,
+                noise_slots,
+                out.as_deref(),
+            )?;
         }
     }
 

@@ -16,6 +16,7 @@ path = "src/main.rs"
 chrono.workspace = true
 clap.workspace = true
 ftxr-core.workspace = true
+num-complex.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 rand_core.workspace = true

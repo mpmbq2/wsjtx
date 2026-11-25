@@ -311,17 +311,19 @@ pub enum FtxrError {
     Internal(String),
 }
 
-/// Stateful, thread-safe FT8/FT4 modem engine (TX implemented in Stage 1; RX in Stages 2–5).
+/// Stateful, thread-safe FT8/FT4 modem engine (TX implemented in Stage 1; FT8 RX in Stage 2; FT4 RX in Stage 4).
 #[derive(Debug, Default)]
 pub struct DecoderEngine {
     hash_table: protocol::hashtable::CallsignHashTable,
+    ft8_decoder: ft8::decoder::Ft8Decoder,
 }
 
 impl DecoderEngine {
-    /// Creates a new modem engine instance with an empty session callsign hash table.
+    /// Creates a new modem engine instance with warm FFT plans and an empty session callsign hash table.
     pub fn new() -> Self {
         Self {
             hash_table: protocol::hashtable::CallsignHashTable::new(),
+            ft8_decoder: ft8::decoder::Ft8Decoder::new(),
         }
     }
 
@@ -330,12 +332,17 @@ impl DecoderEngine {
         &self.hash_table
     }
 
+    /// Returns a reference to the pre-allocated FT8 decoder (for advanced/oracle options).
+    pub fn ft8_decoder_mut(&mut self) -> &mut ft8::decoder::Ft8Decoder {
+        &mut self.ft8_decoder
+    }
+
     /// Clears session-scoped state (callsign hash tables) between bands or operating sessions.
     pub fn reset_session(&mut self) {
         self.hash_table.clear();
     }
 
-    /// Decodes a 12 kHz mono baseband PCM buffer for the configured mode.
+    /// Decodes a 12 kHz mono normalized `f32` (`[-1.0, 1.0]`) baseband PCM buffer.
     pub fn decode(
         &mut self,
         samples_12k: &[f32],
@@ -345,20 +352,63 @@ impl DecoderEngine {
         self.decode_streaming(samples_12k, cfg, &cancel, |_| {})
     }
 
-    /// Decodes a 12 kHz mono baseband PCM buffer, streaming decodes via `on_decode` and honoring `cancel`.
+    /// Decodes a 12 kHz mono normalized `f32` (`[-1.0, 1.0]`) baseband PCM buffer,
+    /// streaming decodes via `on_decode` and honoring `cancel`.
     pub fn decode_streaming<F>(
         &mut self,
-        _samples_12k: &[f32],
-        _cfg: &DecodeConfig,
-        _cancel: &AtomicBool,
-        _on_decode: F,
+        samples_12k: &[f32],
+        cfg: &DecodeConfig,
+        cancel: &AtomicBool,
+        on_decode: F,
     ) -> Result<Vec<DecodedMessage>, FtxrError>
     where
         F: FnMut(DecodedMessage),
     {
-        Err(FtxrError::Unimplemented(
-            "DecoderEngine::decode_streaming (Stage 2/4)",
-        ))
+        match cfg.mode {
+            Mode::Ft8 => self.ft8_decoder.decode_f32(
+                samples_12k,
+                cfg,
+                &self.hash_table,
+                cancel,
+                ft8::decoder::Ft8DecodeOptions::default(),
+                on_decode,
+            ),
+            Mode::Ft4 => Err(FtxrError::Unimplemented("FT4 RX decoder (Stage 4)")),
+        }
+    }
+
+    /// Decodes a 12 kHz mono signed 16-bit (`i16`) PCM buffer with exact `jt9` scaling (`s as f32`).
+    pub fn decode_i16(
+        &mut self,
+        samples_12k: &[i16],
+        cfg: &DecodeConfig,
+    ) -> Result<Vec<DecodedMessage>, FtxrError> {
+        let cancel = AtomicBool::new(false);
+        self.decode_i16_streaming(samples_12k, cfg, &cancel, |_| {})
+    }
+
+    /// Decodes a 12 kHz mono signed 16-bit (`i16`) PCM buffer, streaming decodes via `on_decode`.
+    pub fn decode_i16_streaming<F>(
+        &mut self,
+        samples_12k: &[i16],
+        cfg: &DecodeConfig,
+        cancel: &AtomicBool,
+        on_decode: F,
+    ) -> Result<Vec<DecodedMessage>, FtxrError>
+    where
+        F: FnMut(DecodedMessage),
+    {
+        match cfg.mode {
+            Mode::Ft8 => self.ft8_decoder.decode_i16(
+                samples_12k,
+                cfg,
+                &self.hash_table,
+                cancel,
+                ft8::decoder::Ft8DecodeOptions::default(),
+                on_decode,
+            ),
+            Mode::Ft4 => Err(FtxrError::Unimplemented("FT4 RX decoder (Stage 4)")),
+        }
     }
 
     /// Encodes and GFSK-modulates an FT8 or FT4 message into mono `f32` PCM samples.
@@ -491,15 +541,26 @@ mod tests {
     }
 
     #[test]
-    fn stub_decode_returns_unimplemented_and_modulate_succeeds() {
+    fn ft8_modulate_and_decode_roundtrip_and_ft4_stub() {
         let mut engine = DecoderEngine::new();
-        let cfg = DecodeConfig::for_mode(Mode::Ft8);
+        let cfg_ft4 = DecodeConfig::for_mode(Mode::Ft4);
         assert!(matches!(
-            engine.decode(&[], &cfg),
+            engine.decode(&[], &cfg_ft4),
             Err(FtxrError::Unimplemented(_))
         ));
+
         let mcfg = ModulateConfig::default_for(Mode::Ft8, 1500.0, 12_000);
         let pcm = engine.modulate("CQ N0AAA EM10", &mcfg).unwrap();
         assert_eq!(pcm.len(), 6_000 + 151_680);
+
+        let mut cfg_ft8 = DecodeConfig::for_mode(Mode::Ft8);
+        cfg_ft8.depth = 1;
+        assert!(engine.decode(&[], &cfg_ft8).unwrap().is_empty());
+
+        let decoded = engine.decode(&pcm, &cfg_ft8).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].message, "CQ N0AAA EM10");
+        assert!((decoded[0].af_hz - 1500.0).abs() < 1.0);
+        assert!(decoded[0].dt_sec.abs() < 0.05);
     }
 }
