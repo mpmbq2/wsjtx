@@ -4,8 +4,26 @@
 
 //! Hybrid BP + OSD `decode174_91` entry point (`wsjtx/lib/ft8/decode174_91.f90`).
 
-use super::bp::{bp_decode_174_91, LdpcDecoded, LDPC_N};
-use super::osd::{osd174_91, OsdScratch};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::bp::{bp_decode_174_91_with_scratch, BpScratch, LdpcDecoded, LDPC_N};
+use super::osd::{osd174_91_cancelable, OsdScratch};
+
+/// Combined reusable scratch buffers for LDPC BP + OSD decoding (zero steady-state allocs).
+#[derive(Debug, Clone, Default)]
+pub struct FecScratch {
+    pub bp: BpScratch,
+    pub osd: OsdScratch,
+}
+
+impl FecScratch {
+    pub fn new() -> Self {
+        Self {
+            bp: BpScratch::new(),
+            osd: OsdScratch::new(),
+        }
+    }
+}
 
 /// Hybrid BP + OSD decoder matching `wsjtx/lib/ft8/decode174_91.f90`.
 ///
@@ -19,7 +37,41 @@ pub fn decode174_91(
     apmask: &[u8; LDPC_N],
     osd_scratch: &mut OsdScratch,
 ) -> Option<LdpcDecoded> {
-    let bp = bp_decode_174_91(llr, apmask, max_osd);
+    let mut fec_scratch = FecScratch {
+        bp: BpScratch::new(),
+        osd: std::mem::take(osd_scratch),
+    };
+    let never_cancel = AtomicBool::new(false);
+    let out = decode174_91_with_scratch(
+        llr,
+        keff,
+        max_osd,
+        norder,
+        apmask,
+        &mut fec_scratch,
+        &never_cancel,
+    );
+    *osd_scratch = fec_scratch.osd;
+    out
+}
+
+/// Cancel-aware, scratch-backed hybrid BP + OSD decoder matching `wsjtx/lib/ft8/decode174_91.f90`.
+pub fn decode174_91_with_scratch(
+    llr: &[f32; LDPC_N],
+    keff: usize,
+    max_osd: i32,
+    norder: u8,
+    apmask: &[u8; LDPC_N],
+    scratch: &mut FecScratch,
+    cancel: &AtomicBool,
+) -> Option<LdpcDecoded> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+    let bp = bp_decode_174_91_with_scratch(llr, apmask, max_osd, &mut scratch.bp, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     if let Some(decoded) = bp.decoded {
         return Some(decoded);
     }
@@ -28,8 +80,13 @@ pub fn decode174_91(
         return None;
     }
 
-    for zrow in bp.zsave.iter().take(bp.num_zsave) {
-        if let Some(res) = osd174_91(zrow, keff, apmask, norder, osd_scratch) {
+    for (pass_idx, zrow) in bp.zsave.iter().take(bp.num_zsave).enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
+        if let Some(res) =
+            osd174_91_cancelable(zrow, keff, apmask, norder, &mut scratch.osd, cancel)
+        {
             if res.crc_ok && res.nhardmin > 0 {
                 let mut dmin = 0.0_f32;
                 for b in 0..LDPC_N {
@@ -38,6 +95,7 @@ pub fn decode174_91(
                         dmin += llr[b].abs();
                     }
                 }
+                let bp_pass = if max_osd == 0 { 0 } else { (pass_idx + 1) as u8 };
                 return Some(LdpcDecoded {
                     message91: res.message91,
                     codeword: res.cw,
@@ -45,6 +103,7 @@ pub fn decode174_91(
                     dmin,
                     fec_method: crate::telemetry::FecMethod::Osd {
                         order: res.winning_order,
+                        bp_pass,
                     },
                 });
             }

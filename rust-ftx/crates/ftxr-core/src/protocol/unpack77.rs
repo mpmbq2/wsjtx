@@ -6,7 +6,9 @@
 
 use crate::FtxrError;
 
-use super::hashtable::{compute_all_hashes, sanitize_hash_call, CallsignHashTable, HASH_ALPHABET};
+use super::hashtable::{
+    compute_all_hashes, sanitize_hash_call, CallsignHashTable, CallsignLookup, HASH_ALPHABET,
+};
 use super::pack77::{FREETEXT_ALPHABET, MAX22, MAXGRID4, NTOKENS};
 use super::types::{
     MessageType, PendingHashUpdates, UnpackContext, UnpackMode, UnpackedMessage, ARRL_SECTIONS,
@@ -53,7 +55,7 @@ pub fn callok(call: &str) -> bool {
 }
 
 /// Port of `unpack28` (`wsjtx/lib/77bit/packjt77.f90:836-917`).
-pub fn unpack28(n28: u32, hash_table: &CallsignHashTable) -> (String, bool) {
+pub fn unpack28<H: CallsignLookup + ?Sized>(n28: u32, hash_table: &H) -> (String, bool) {
     let mut success = true;
     let mut c13: String;
 
@@ -270,11 +272,11 @@ fn to_grid_wspr_base25(n: u32) -> Option<String> {
 /// Pure read-only 77-bit message decoder safe for concurrent Rayon workers.
 ///
 /// Emits deferred hash-table mutations in `UnpackedMessage::pending_hashes`.
-pub fn unpack77_readonly(
+pub fn unpack77_readonly<H: CallsignLookup + ?Sized>(
     bits: &[u8; PAYLOAD_BITS],
     mode: UnpackMode,
     ctx: &UnpackContext,
-    hash_table: &CallsignHashTable,
+    hash_table: &H,
 ) -> Result<UnpackedMessage, FtxrError> {
     if bits.iter().any(|&b| b > 1) {
         return Err(FtxrError::UnpackFailed);

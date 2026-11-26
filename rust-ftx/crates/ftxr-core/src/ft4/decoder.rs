@@ -4,6 +4,7 @@
 
 //! Single-slot FT4 RX decoder pipeline (`wsjtx/lib/ft4_decode.f90`).
 
+use std::collections::HashSet;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -11,15 +12,19 @@ use num_complex::Complex32;
 
 use crate::dsp::downsample::{Ft4DownsampleScratch, Ft4Downsampler, Ft4PassSpectrum};
 use crate::dsp::fft::Ft4FftPlans;
+use crate::dsp::pool::{
+    run_ordered_candidates, CandidateScratchPool, PassScratchPool, PrecomputedTables,
+};
 use crate::fec::bp::{LdpcDecoded, LDPC_N};
-use crate::fec::decode174_91::decode174_91;
-use crate::fec::osd::OsdScratch;
+use crate::fec::decode174_91::{decode174_91_with_scratch, FecScratch};
 use crate::modulate::ft4::encode_ft4_tones_from_77bits;
-use crate::protocol::hashtable::CallsignHashTable;
+use crate::protocol::hashtable::{sanitize_hash_call, CallsignHashTable, CallsignLookup};
 use crate::protocol::rvec::descramble_ft4;
-use crate::protocol::types::{UnpackContext, UnpackMode};
+use crate::protocol::types::{PendingHashUpdates, UnpackContext, UnpackMode, PAYLOAD_BITS};
 use crate::protocol::unpack77::unpack77_readonly;
-use crate::telemetry::DecodeTelemetry;
+use crate::telemetry::{
+    compute_ft4_symbol_envelope, estimate_ft4_costas_drift, DecodeTelemetry, SymbolEnvelope,
+};
 use crate::{ApTag, DecodeConfig, DecodedMessage, FtxrError, Mode};
 
 use super::ap::{build_ft4_ap_pass, ft4_ap_schedule, Ft4ApSet, Ft4ApTables};
@@ -158,7 +163,7 @@ pub struct Ft4Scratch {
     cd: [Complex32; NFRAME_DOWN],
     bm: Ft4BitMetricsScratch,
     sub: Ft4SubtractScratch,
-    osd: OsdScratch,
+    fec: crate::fec::decode174_91::FecScratch,
     bitmetrics: [[f32; 3]; NBITS],
     pass_llr: [f32; LDPC_N],
     apmask: [u8; LDPC_N],
@@ -176,7 +181,7 @@ impl Ft4Scratch {
             cd: [Complex32::ZERO; NFRAME_DOWN],
             bm: Ft4BitMetricsScratch::new(&plans.fft),
             sub: Ft4SubtractScratch::new(&plans.fft),
-            osd: OsdScratch::new(),
+            fec: crate::fec::decode174_91::FecScratch::new(),
             bitmetrics: [[0.0_f32; 3]; NBITS],
             pass_llr: [0.0_f32; LDPC_N],
             apmask: [0; LDPC_N],
@@ -311,130 +316,326 @@ impl Ft4Decoder {
         hash_table: &CallsignHashTable,
         cancel: Option<&AtomicBool>,
         options: Ft4DecodeOptions,
-        mut probe: Option<&mut dyn Ft4Probe>,
+        probe: Option<&mut dyn Ft4Probe>,
         on_decode: &mut dyn FnMut(DecodedMessage),
     ) -> Result<Vec<DecodedMessage>, FtxrError> {
-        if let Some(flag) = cancel {
-            if flag.load(Ordering::Relaxed) {
-                return Err(FtxrError::Cancelled);
-            }
-        }
-        if self.scratch.dd.iter().all(|&v| v == 0.0) {
-            return Ok(Vec::new());
-        }
-
-        let effective_rx_freq_hz = match cfg.qso.as_ref() {
-            Some(q) if (q.rx_freq_hz - 1500.0).abs() > 1e-3 => q.rx_freq_hz,
-            _ => cfg.rx_freq_hz,
+        let never_cancel = AtomicBool::new(false);
+        let cancel_flag = cancel.unwrap_or(&never_cancel);
+        let active_samples_12k = self
+            .scratch
+            .dd
+            .iter()
+            .rposition(|&x| x != 0.0)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let mut hash_snapshot = crate::protocol::hashtable::PassHashSnapshot::new();
+        let mut inline_bufs = Ft4InlineEvalScratch {
+            cd0: &mut self.scratch.cd0,
+            cb: &mut self.scratch.cb,
+            cd: &mut self.scratch.cd,
+            bm: &mut self.scratch.bm,
+            fec: &mut self.scratch.fec,
+            bitmetrics: &mut self.scratch.bitmetrics,
+            pass_llr: &mut self.scratch.pass_llr,
+            apmask: &mut self.scratch.apmask,
         };
-        let depth = cfg.depth.clamp(1, 3);
-        let mut ap_set = Ft4ApSet::from_context(cfg.qso.as_ref(), hash_table);
-        ap_set.rx_freq_hz = effective_rx_freq_hz;
+        decode_ft4_dd_core(
+            Ft4PlanRefs::from_plans(&self.plans),
+            &self.plans.cand,
+            &self.plans.sub,
+            &mut self.scratch.dd,
+            &mut self.scratch.cand,
+            &mut self.scratch.down,
+            &mut self.scratch.pass_spectrum,
+            &mut self.scratch.sub,
+            &mut hash_snapshot,
+            Some(&mut inline_bufs),
+            None,
+            active_samples_12k,
+            cfg,
+            hash_table,
+            cancel_flag,
+            options,
+            probe,
+            on_decode,
+        )
+    }
+}
 
-        let schedule = ft4_ap_schedule(depth, &ap_set);
-        let unpack_ctx = match cfg.qso.as_ref() {
-            Some(q) => UnpackContext {
-                my_call: q.my_call.clone(),
-                dx_call: q.his_call.clone(),
-                dx_base: None,
-            },
-            None => UnpackContext::default(),
-        };
+struct Ft4InlineEvalScratch<'a> {
+    cd0: &'a mut [Complex32; NDMAX],
+    cb: &'a mut [Complex32; NDMAX],
+    cd: &'a mut [Complex32; NFRAME_DOWN],
+    bm: &'a mut Ft4BitMetricsScratch,
+    fec: &'a mut FecScratch,
+    bitmetrics: &'a mut [[f32; 3]; NBITS],
+    pass_llr: &'a mut [f32; LDPC_N],
+    apmask: &'a mut [u8; LDPC_N],
+}
 
-        let mut decodes = Vec::new();
-        let mut seen_messages: Vec<String> = Vec::new();
-        let max_passes = options.max_subtraction_passes.max(1);
-        let mut prev_pass_decodes = 0usize;
+/// Shared parallel FT4 RX entry point over normalized `f32` PCM used by `DecoderEngine`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ft4_shared_f32<F>(
+    samples_12k: &[f32],
+    cfg: &DecodeConfig,
+    tables: &PrecomputedTables,
+    pass_pool: &PassScratchPool,
+    cand_pool: &CandidateScratchPool,
+    rx_pool: Option<&rayon::ThreadPool>,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    options: Ft4DecodeOptions,
+    mut on_decode: F,
+) -> Result<Vec<DecodedMessage>, FtxrError>
+where
+    F: FnMut(DecodedMessage),
+{
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FtxrError::Cancelled);
+    }
+    let mut pass = pass_pool.checkout();
+    let n = samples_12k.len().min(NMAX);
+    for (dst, &src) in pass.dd[..n].iter_mut().zip(samples_12k[..n].iter()) {
+        *dst = src * 32768.0;
+    }
+    pass.dd[n..NMAX].fill(0.0);
+    let p = &mut *pass;
+    let ft4_dd: &mut [f32; NMAX] = (&mut p.dd[..NMAX])
+        .try_into()
+        .expect("exact FT4 NMAX slice");
+    decode_ft4_dd_core(
+        Ft4PlanRefs::from_tables(tables),
+        &tables.ft4_cand,
+        &tables.ft4_subtractor,
+        ft4_dd,
+        &mut p.ft4_cand,
+        &mut p.ft4_down,
+        &mut p.ft4_spectrum,
+        &mut p.ft4_sub,
+        &mut p.hash_snapshot,
+        None,
+        rx_pool.map(|pool| (cand_pool, pool)),
+        n,
+        cfg,
+        hash_table,
+        cancel,
+        options,
+        None,
+        &mut on_decode,
+    )
+}
 
-        for sub_pass in 0..max_passes {
-            if sub_pass > 0 && prev_pass_decodes == 0 {
-                break;
-            }
-            if let Some(flag) = cancel {
-                if flag.load(Ordering::Relaxed) {
+/// Shared parallel FT4 RX entry point over `i16` PCM used by `DecoderEngine`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ft4_shared_i16<F>(
+    samples_12k: &[i16],
+    cfg: &DecodeConfig,
+    tables: &PrecomputedTables,
+    pass_pool: &PassScratchPool,
+    cand_pool: &CandidateScratchPool,
+    rx_pool: Option<&rayon::ThreadPool>,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    options: Ft4DecodeOptions,
+    mut on_decode: F,
+) -> Result<Vec<DecodedMessage>, FtxrError>
+where
+    F: FnMut(DecodedMessage),
+{
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FtxrError::Cancelled);
+    }
+    let mut pass = pass_pool.checkout();
+    let n = samples_12k.len().min(NMAX);
+    for (dst, &src) in pass.dd[..n].iter_mut().zip(samples_12k[..n].iter()) {
+        *dst = f32::from(src);
+    }
+    pass.dd[n..NMAX].fill(0.0);
+    let p = &mut *pass;
+    let ft4_dd: &mut [f32; NMAX] = (&mut p.dd[..NMAX])
+        .try_into()
+        .expect("exact FT4 NMAX slice");
+    decode_ft4_dd_core(
+        Ft4PlanRefs::from_tables(tables),
+        &tables.ft4_cand,
+        &tables.ft4_subtractor,
+        ft4_dd,
+        &mut p.ft4_cand,
+        &mut p.ft4_down,
+        &mut p.ft4_spectrum,
+        &mut p.ft4_sub,
+        &mut p.hash_snapshot,
+        None,
+        rx_pool.map(|pool| (cand_pool, pool)),
+        n,
+        cfg,
+        hash_table,
+        cancel,
+        options,
+        None,
+        &mut on_decode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_ft4_dd_core(
+    plans: Ft4PlanRefs<'_>,
+    cand_plan: &Ft4CandidatePlan,
+    subtractor: &Ft4Subtractor,
+    dd: &mut [f32; NMAX],
+    cand_scratch: &mut Ft4CandidateScratch,
+    down_scratch: &mut Ft4DownsampleScratch,
+    pass_spectrum: &mut Ft4PassSpectrum,
+    sub_scratch: &mut Ft4SubtractScratch,
+    hash_snapshot: &mut crate::protocol::hashtable::PassHashSnapshot,
+    mut inline_eval: Option<&mut Ft4InlineEvalScratch<'_>>,
+    parallel: Option<(&CandidateScratchPool, &rayon::ThreadPool)>,
+    active_samples_12k: usize,
+    cfg: &DecodeConfig,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    options: Ft4DecodeOptions,
+    mut probe: Option<&mut dyn Ft4Probe>,
+    on_decode: &mut dyn FnMut(DecodedMessage),
+) -> Result<Vec<DecodedMessage>, FtxrError> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FtxrError::Cancelled);
+    }
+    if dd.iter().all(|&v| v == 0.0) {
+        return Ok(Vec::new());
+    }
+
+    let effective_rx_freq_hz = match cfg.qso.as_ref() {
+        Some(q) if (q.rx_freq_hz - 1500.0).abs() > 1e-3 => q.rx_freq_hz,
+        _ => cfg.rx_freq_hz,
+    };
+    let my_call_clean = cfg
+        .qso
+        .as_ref()
+        .and_then(|q| q.my_call.as_deref())
+        .and_then(sanitize_hash_call)
+        .filter(|c| c.len() >= 3);
+    let depth = cfg.depth.clamp(1, 3);
+    let mut ap_set = Ft4ApSet::from_context(cfg.qso.as_ref(), hash_table);
+    ap_set.rx_freq_hz = effective_rx_freq_hz;
+
+    let schedule = ft4_ap_schedule(depth, &ap_set);
+    let unpack_ctx = match cfg.qso.as_ref() {
+        Some(q) => UnpackContext {
+            my_call: q.my_call.clone(),
+            dx_call: q.his_call.clone(),
+            dx_base: None,
+        },
+        None => UnpackContext::default(),
+    };
+
+    let mut decodes = Vec::new();
+    let mut seen_messages: HashSet<String> = HashSet::new();
+    let max_passes = if cfg.early_pass {
+        1
+    } else {
+        options.max_subtraction_passes.max(1)
+    };
+    let mut prev_pass_decodes = 0usize;
+    let mut tier0: Vec<Ft4Candidate> = Vec::new();
+    let mut tier1: Vec<Ft4Candidate> = Vec::new();
+    let mut to_subtract: Vec<([u8; NN], f32, f32)> = Vec::new();
+
+    for sub_pass in 0..max_passes {
+        if sub_pass > 0 && prev_pass_decodes == 0 {
+            break;
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+
+        let cands = find_candidates(
+            dd,
+            cfg.freq_min_hz,
+            cfg.freq_max_hz,
+            effective_rx_freq_hz,
+            plans.fft,
+            cand_plan,
+            cand_scratch,
+        );
+        if let Some(ref mut p) = probe {
+            p.on_candidates(
+                sub_pass,
+                cand_scratch.savg(),
+                cand_scratch.savsm_normalized(),
+                cand_scratch.sbase(),
+                &cands,
+            );
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        if cands.is_empty() {
+            break;
+        }
+
+        plans
+            .down
+            .compute_pass_spectrum(dd, plans.fft, down_scratch, pass_spectrum);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+
+        let mut pass_decodes = 0usize;
+
+        if probe.is_some() || parallel.is_none() {
+            for (cand_idx, cand) in cands.iter().enumerate() {
+                if cancel.load(Ordering::Relaxed) {
                     return Err(FtxrError::Cancelled);
                 }
-            }
-
-            let cands = find_candidates(
-                &self.scratch.dd,
-                cfg.freq_min_hz,
-                cfg.freq_max_hz,
-                effective_rx_freq_hz,
-                &self.plans.fft,
-                &self.plans.cand,
-                &mut self.scratch.cand,
-            );
-            if let Some(ref mut p) = probe {
-                p.on_candidates(
-                    sub_pass,
-                    self.scratch.cand.savg(),
-                    self.scratch.cand.savsm_normalized(),
-                    self.scratch.cand.sbase(),
-                    &cands,
-                );
-            }
-            if cands.is_empty() {
-                break;
-            }
-
-            self.plans.down.compute_pass_spectrum(
-                &self.scratch.dd,
-                &self.plans.fft,
-                &mut self.scratch.down,
-                &mut self.scratch.pass_spectrum,
-            );
-
-            let mut pass_decodes = 0usize;
-            for (cand_idx, cand) in cands.iter().enumerate() {
-                if let Some(flag) = cancel {
-                    if flag.load(Ordering::Relaxed) {
-                        return Err(FtxrError::Cancelled);
-                    }
-                }
-
-                let outcome = evaluate_ft4_candidate(
-                    sub_pass,
-                    cand_idx,
-                    *cand,
-                    effective_rx_freq_hz,
-                    depth,
-                    &schedule,
-                    &ap_set,
-                    &unpack_ctx,
-                    hash_table,
-                    &self.plans,
-                    &self.scratch.pass_spectrum,
-                    &mut self.scratch.down,
-                    &mut self.scratch.cd0,
-                    &mut self.scratch.cb,
-                    &mut self.scratch.cd,
-                    &mut self.scratch.bm,
-                    &mut self.scratch.osd,
-                    &mut self.scratch.bitmetrics,
-                    &mut self.scratch.pass_llr,
-                    &mut self.scratch.apmask,
-                    &mut probe,
-                );
+                let outcome = if let Some(bufs) = inline_eval.as_deref_mut() {
+                    evaluate_ft4_candidate(
+                        sub_pass,
+                        cand_idx,
+                        *cand,
+                        effective_rx_freq_hz,
+                        depth,
+                        &schedule,
+                        &ap_set,
+                        &unpack_ctx,
+                        hash_table,
+                        plans,
+                        pass_spectrum,
+                        down_scratch,
+                        bufs.cd0,
+                        bufs.cb,
+                        bufs.cd,
+                        bufs.bm,
+                        bufs.fec,
+                        bufs.bitmetrics,
+                        bufs.pass_llr,
+                        bufs.apmask,
+                        &mut probe,
+                        cancel,
+                        cfg.enable_telemetry,
+                        active_samples_12k,
+                        cfg.early_pass,
+                    )
+                } else {
+                    None
+                };
 
                 if let Some(eval) = outcome {
+                    hash_table.apply_updates(&eval.pending_hashes, my_call_clean.as_deref());
                     let dt_raw_sec = (eval.ibest as f32) / DT_RATE_LITERAL;
-                    self.plans.sub.subtract(
-                        &mut self.scratch.dd,
+                    subtractor.subtract(
+                        dd,
                         &eval.tones,
                         eval.f1_hz,
                         dt_raw_sec,
-                        &self.plans.fft,
-                        &mut self.scratch.sub,
+                        plans.fft,
+                        sub_scratch,
                     );
                     if let Some(ref mut p) = probe {
-                        p.on_subtract_residual(sub_pass, cand_idx, &self.scratch.dd);
+                        p.on_subtract_residual(sub_pass, cand_idx, dd);
                     }
 
-                    // Subtraction runs before duplicate suppression (ft4_decode.f90:435-443),
-                    // preventing residual harmonic/multipath copies of already-decoded messages.
-                    if !seen_messages.contains(&eval.message) {
-                        seen_messages.push(eval.message.clone());
+                    if seen_messages.insert(eval.message.clone()) {
                         let snr_linear = cand.snr_ratio - 1.0;
                         let snr_raw = if snr_linear > 0.0 {
                             (10.0 * snr_linear.log10() - SNR_OFFSET_DB).max(SNR_FLOOR_DB)
@@ -451,13 +652,12 @@ impl Ft4Decoder {
                                 hard_errors: eval.nhard_errors.max(0) as u16,
                                 osd_distance: eval.dmin,
                                 quality: eval.qual,
-                                freq_drift_hz: Some(eval.idfbest as f32),
-                                qsb_envelope: None,
+                                freq_drift_hz: eval.freq_drift_hz,
+                                qsb_envelope: eval.qsb_envelope.clone(),
                             })
                         } else {
                             None
                         };
-
                         let decoded = DecodedMessage {
                             mode: Mode::Ft4,
                             snr_db,
@@ -474,19 +674,161 @@ impl Ft4Decoder {
                     }
                 }
             }
+        } else if let Some(pool_pair) = parallel {
+            let tier0_tol = cfg.freq_tol_hz.max(super::params::NFQSO_PRIOR_HZ);
+            tier0.clear();
+            tier1.clear();
+            if cfg.qso_first {
+                for cand in cands {
+                    if (cand.freq_hz - effective_rx_freq_hz).abs() <= tier0_tol {
+                        tier0.push(cand);
+                    } else {
+                        tier1.push(cand);
+                    }
+                }
+            } else {
+                tier1 = cands;
+            }
 
-            prev_pass_decodes = pass_decodes;
+            for tier in [&tier0, &tier1] {
+                if tier.is_empty() {
+                    continue;
+                }
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(FtxrError::Cancelled);
+                }
+                hash_table.snapshot_into(hash_snapshot);
+                let hash_snap_ref = &*hash_snapshot;
+                to_subtract.clear();
+
+                let schedule_ref = &schedule;
+                let ap_set_ref = &ap_set;
+                let unpack_ctx_ref = &unpack_ctx;
+
+                run_ordered_candidates(
+                    tier,
+                    Some(pool_pair),
+                    cancel,
+                    |cand, cand_bufs| {
+                        let mut no_probe = None;
+                        evaluate_ft4_candidate(
+                            sub_pass,
+                            0,
+                            *cand,
+                            effective_rx_freq_hz,
+                            depth,
+                            schedule_ref,
+                            ap_set_ref,
+                            unpack_ctx_ref,
+                            hash_snap_ref,
+                            plans,
+                            pass_spectrum,
+                            &mut cand_bufs.ft4_down,
+                            &mut cand_bufs.ft4_cd0,
+                            &mut cand_bufs.ft4_cb,
+                            &mut cand_bufs.ft4_cd,
+                            &mut cand_bufs.ft4_bm,
+                            &mut cand_bufs.fec,
+                            &mut cand_bufs.ft4_bitmetrics,
+                            &mut cand_bufs.ft4_pass_llr,
+                            &mut cand_bufs.ft4_apmask,
+                            &mut no_probe,
+                            cancel,
+                            cfg.enable_telemetry,
+                            active_samples_12k,
+                            cfg.early_pass,
+                        )
+                    },
+                    |idx, mut eval| {
+                        if eval.message.contains("<...>") {
+                            if let Ok(re_unpacked) = unpack77_readonly(
+                                &eval.message77,
+                                UnpackMode::Rx,
+                                &unpack_ctx,
+                                hash_table,
+                            ) {
+                                eval.message = re_unpacked.text;
+                                eval.pending_hashes = re_unpacked.pending_hashes;
+                            }
+                        }
+                        hash_table.apply_updates(&eval.pending_hashes, my_call_clean.as_deref());
+                        let dt_raw_sec = (eval.ibest as f32) / DT_RATE_LITERAL;
+                        to_subtract.push((eval.tones, eval.f1_hz, dt_raw_sec));
+
+                        if seen_messages.insert(eval.message.clone()) {
+                            let cand = &tier[idx];
+                            let snr_linear = cand.snr_ratio - 1.0;
+                            let snr_raw = if snr_linear > 0.0 {
+                                (10.0 * snr_linear.log10() - SNR_OFFSET_DB).max(SNR_FLOOR_DB)
+                            } else {
+                                SNR_FLOOR_DB
+                            };
+                            let snr_db = snr_raw.round().clamp(SNR_FLOOR_DB, 99.0) as i8;
+                            let dt_sec = dt_raw_sec - DT_OFFSET_S;
+                            let telemetry = if cfg.enable_telemetry {
+                                Some(DecodeTelemetry {
+                                    fec_method: eval.fec_method,
+                                    sync_score: eval.smax,
+                                    subtraction_pass: (sub_pass + 1) as u8,
+                                    hard_errors: eval.nhard_errors.max(0) as u16,
+                                    osd_distance: eval.dmin,
+                                    quality: eval.qual,
+                                    freq_drift_hz: eval.freq_drift_hz,
+                                    qsb_envelope: eval.qsb_envelope.clone(),
+                                })
+                            } else {
+                                None
+                            };
+                            let decoded = DecodedMessage {
+                                mode: Mode::Ft4,
+                                snr_db,
+                                snr_raw,
+                                dt_sec,
+                                af_hz: eval.f1_hz,
+                                message: eval.message,
+                                ap_tag: eval.ap_tag,
+                                telemetry,
+                            };
+                            on_decode(decoded.clone());
+                            decodes.push(decoded);
+                            pass_decodes += 1;
+                        }
+                    },
+                );
+
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(FtxrError::Cancelled);
+                }
+
+                for (tones, f1_hz, dt_raw_sec) in to_subtract.drain(..) {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(FtxrError::Cancelled);
+                    }
+                    subtractor.subtract(
+                        dd,
+                        &tones,
+                        f1_hz,
+                        dt_raw_sec,
+                        plans.fft,
+                        sub_scratch,
+                    );
+                }
+            }
         }
 
-        Ok(decodes)
+        prev_pass_decodes = pass_decodes;
     }
+
+    Ok(decodes)
 }
 
 struct CandidateDecodeSuccess {
     message: String,
+    message77: [u8; PAYLOAD_BITS],
     tones: [u8; NN],
     f1_hz: f32,
     ibest: i32,
+    #[allow(dead_code)]
     idfbest: i32,
     smax: f32,
     nhard_errors: i32,
@@ -494,10 +836,41 @@ struct CandidateDecodeSuccess {
     qual: f32,
     ap_tag: ApTag,
     fec_method: crate::telemetry::FecMethod,
+    pending_hashes: PendingHashUpdates,
+    freq_drift_hz: Option<f32>,
+    qsb_envelope: Option<SymbolEnvelope>,
+}
+
+#[derive(Clone, Copy)]
+struct Ft4PlanRefs<'a> {
+    fft: &'a Ft4FftPlans,
+    down: &'a Ft4Downsampler,
+    sync: &'a Ft4SyncTables,
+    ap: &'a Ft4ApTables,
+}
+
+impl<'a> Ft4PlanRefs<'a> {
+    fn from_plans(p: &'a Ft4Plans) -> Self {
+        Self {
+            fft: &p.fft,
+            down: &p.down,
+            sync: &p.sync,
+            ap: &p.ap,
+        }
+    }
+
+    fn from_tables(t: &'a PrecomputedTables) -> Self {
+        Self {
+            fft: &t.fft.ft4,
+            down: &t.ft4_downsampler,
+            sync: &t.ft4_sync,
+            ap: &t.ft4_ap,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn evaluate_ft4_candidate(
+fn evaluate_ft4_candidate<H: CallsignLookup + ?Sized>(
     sub_pass: usize,
     cand_idx: usize,
     cand: Ft4Candidate,
@@ -506,24 +879,31 @@ fn evaluate_ft4_candidate(
     schedule: &[super::ap::Ft4PassSpec],
     ap_set: &Ft4ApSet,
     unpack_ctx: &UnpackContext,
-    hash_table: &CallsignHashTable,
-    plans: &Ft4Plans,
+    hash_table: &H,
+    plans: Ft4PlanRefs<'_>,
     pass_spectrum: &Ft4PassSpectrum,
     down_scratch: &mut Ft4DownsampleScratch,
     cd0: &mut [Complex32; NDMAX],
     cb: &mut [Complex32; NDMAX],
     cd: &mut [Complex32; NFRAME_DOWN],
     bm_scratch: &mut Ft4BitMetricsScratch,
-    osd_scratch: &mut OsdScratch,
+    fec_scratch: &mut FecScratch,
     bitmetrics: &mut [[f32; 3]; NBITS],
     pass_llr: &mut [f32; LDPC_N],
     apmask: &mut [u8; LDPC_N],
     probe: &mut Option<&mut dyn Ft4Probe>,
+    cancel: &AtomicBool,
+    enable_telemetry: bool,
+    active_samples_12k: usize,
+    early_pass: bool,
 ) -> Option<CandidateDecodeSuccess> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     let f0 = cand.freq_hz;
     plans
         .down
-        .downsample_from_spectrum(pass_spectrum, f0, &plans.fft, down_scratch, cd0);
+        .downsample_from_spectrum(pass_spectrum, f0, plans.fft, down_scratch, cd0);
     let sum2: f32 = cd0.iter().map(|c| c.norm_sqr()).sum::<f32>() / (NDMAX as f32);
     if sum2 > 0.0 && sum2.is_finite() {
         let inv_rms = 1.0_f32 / sum2.sqrt();
@@ -536,6 +916,9 @@ fn evaluate_ft4_candidate(
     let mut best_cb_sampled = false;
 
     for (iseg, &(ib_start, ib_end)) in DT_SEGMENTS.iter().enumerate() {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let mut smax_coarse = -99.0_f32;
         let mut ibest_coarse = ib_start;
         let mut idfbest_coarse = 0i32;
@@ -581,7 +964,7 @@ fn evaluate_ft4_candidate(
 
         plans
             .down
-            .downsample_from_spectrum(pass_spectrum, f1_hz, &plans.fft, down_scratch, cb);
+            .downsample_from_spectrum(pass_spectrum, f1_hz, plans.fft, down_scratch, cb);
         let sum2_cb: f32 = cb.iter().map(|c| c.norm_sqr()).sum::<f32>() / (NFRAME_DOWN as f32);
         if sum2_cb > 0.0 && sum2_cb.is_finite() {
             let inv_rms = 1.0_f32 / sum2_cb.sqrt();
@@ -601,7 +984,7 @@ fn evaluate_ft4_candidate(
 
         slice_frame_cd(cb, ibest, cd);
 
-        let bm_status = get_ft4_bitmetrics(cd, &plans.fft, bm_scratch, bitmetrics);
+        let bm_status = get_ft4_bitmetrics(cd, plans.fft, bm_scratch, bitmetrics);
         if bm_status.badsync {
             continue;
         }
@@ -626,6 +1009,8 @@ fn evaluate_ft4_candidate(
 
         let maxosd = if depth <= 2 {
             -1
+        } else if early_pass {
+            1
         } else if (rx_freq_hz - f1_hz).abs() <= NAPWID_HZ {
             3
         } else {
@@ -636,11 +1021,14 @@ fn evaluate_ft4_candidate(
         let mut success: Option<CandidateDecodeSuccess> = None;
 
         for (ap_pass_idx, &pass_spec) in schedule.iter().enumerate() {
+            if cancel.load(Ordering::Relaxed) {
+                return None;
+            }
             if !build_ft4_ap_pass(
                 pass_spec,
                 &llrs,
                 f1_hz,
-                &plans.ap,
+                plans.ap,
                 ap_set,
                 pass_llr,
                 apmask,
@@ -648,7 +1036,15 @@ fn evaluate_ft4_candidate(
                 continue;
             }
 
-            let ldpc_opt = decode174_91(pass_llr, 91, maxosd, 2, apmask, osd_scratch);
+            let ldpc_opt = decode174_91_with_scratch(
+                pass_llr,
+                91,
+                maxosd,
+                2,
+                apmask,
+                fec_scratch,
+                cancel,
+            );
             if let Some(p) = probe.as_deref_mut() {
                 p.on_ldpc_attempt(
                     sub_pass,
@@ -673,16 +1069,30 @@ fn evaluate_ft4_candidate(
                 ldpc_won = true;
                 match unpack77_readonly(&msg77, UnpackMode::Rx, unpack_ctx, hash_table) {
                     Ok(unpacked) => {
-                        hash_table.apply_updates(
-                            &unpacked.pending_hashes,
-                            unpack_ctx.my_call.as_deref(),
-                        );
                         let tones = encode_ft4_tones_from_77bits(&msg77);
                         let qual =
                             1.0_f32 - (ldpc_dec.nhard_errors as f32 + ldpc_dec.dmin) / 60.0;
                         let ap_tag = ApTag::from_wsjtx(pass_spec.ap_type as u8, qual);
+                        let (freq_drift_hz, qsb_envelope) = if enable_telemetry {
+                            let drift = estimate_ft4_costas_drift(
+                                cd,
+                                ibest as isize,
+                                active_samples_12k,
+                            );
+                            let env = compute_ft4_symbol_envelope(
+                                cd,
+                                ibest as isize,
+                                &tones,
+                                drift,
+                                active_samples_12k,
+                            );
+                            (drift, env)
+                        } else {
+                            (None, None)
+                        };
                         success = Some(CandidateDecodeSuccess {
                             message: unpacked.text,
+                            message77: msg77,
                             tones,
                             f1_hz,
                             ibest,
@@ -693,6 +1103,9 @@ fn evaluate_ft4_candidate(
                             qual,
                             ap_tag,
                             fec_method: ldpc_dec.fec_method,
+                            pending_hashes: unpacked.pending_hashes,
+                            freq_drift_hz,
+                            qsb_envelope,
                         });
                     }
                     Err(_) => {

@@ -162,7 +162,7 @@ pub fn run_ft8_mvp_bench(
     let ft4_warmup = wsjtx_root.join("samples/FT4/000000_000002.wav");
     let wisdom = jt9.ensure_warm_wisdom(1, &ft8_warmup, &ft4_warmup)?;
 
-    let mut engine = DecoderEngine::new();
+    let engine = DecoderEngine::new();
     let mut cfg = DecodeConfig::for_mode(Mode::Ft8);
     cfg.depth = 1;
     cfg.freq_min_hz = 200.0;

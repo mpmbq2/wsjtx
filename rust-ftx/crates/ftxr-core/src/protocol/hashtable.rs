@@ -7,7 +7,6 @@
 //! Zero global/static mutable state: each `DecoderEngine` or caller owns a
 //! `CallsignHashTable` (`Send + Sync`, `RwLock`-backed).
 
-use std::collections::VecDeque;
 use std::sync::RwLock;
 
 use super::types::PendingHashUpdates;
@@ -97,13 +96,80 @@ pub(crate) fn sanitize_hash_call(raw_call: &str) -> Option<String> {
     Some(clean)
 }
 
+const COMPACT_CALL_CAP: usize = 23;
+
+/// Inline `Copy` callsign buffer avoiding per-entry heap allocations inside the hash table and pass snapshots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactCall {
+    bytes: [u8; COMPACT_CALL_CAP],
+    len: u8,
+}
+
+impl Default for CompactCall {
+    fn default() -> Self {
+        Self {
+            bytes: [0u8; COMPACT_CALL_CAP],
+            len: 0,
+        }
+    }
+}
+
+impl CompactCall {
+    pub fn from_str_clean(s: &str) -> Self {
+        let b = s.as_bytes();
+        let mut copy_len = b.len().min(COMPACT_CALL_CAP);
+        while copy_len > 0 && !s.is_char_boundary(copy_len) {
+            copy_len -= 1;
+        }
+        let mut bytes = [0u8; COMPACT_CALL_CAP];
+        bytes[..copy_len].copy_from_slice(&b[..copy_len]);
+        Self {
+            bytes,
+            len: copy_len as u8,
+        }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
+    }
+}
+
+/// Read-only callsign hash lookup trait shared between live `CallsignHashTable` and lock-free `PassHashSnapshot`.
+pub trait CallsignLookup: Sync {
+    fn lookup_10(&self, h10: u16) -> Option<String>;
+    fn lookup_12(&self, h12: u16) -> Option<String>;
+    fn lookup_22(&self, h22: u32) -> Option<String>;
+
+    fn format_10(&self, h10: u16) -> String {
+        match self.lookup_10(h10) {
+            Some(c) => format!("<{c}>"),
+            None => "<...>".to_string(),
+        }
+    }
+
+    fn format_12(&self, h12: u16) -> String {
+        match self.lookup_12(h12) {
+            Some(c) => format!("<{c}>"),
+            None => "<...>".to_string(),
+        }
+    }
+
+    fn format_22(&self, h22: u32) -> String {
+        match self.lookup_22(h22) {
+            Some(c) => format!("<{c}>"),
+            None => "<...>".to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HashTableInner {
-    calls10: Box<[Option<String>; 1024]>,
-    calls12: Box<[Option<String>; 4096]>,
+    calls10: Box<[Option<CompactCall>; 1024]>,
+    calls12: Box<[Option<CompactCall>; 4096]>,
     /// Front = most recent; max length `MAX_HASH22` (1000).
-    calls22: VecDeque<(u32, String)>,
-    recent_calls: VecDeque<String>,
+    calls22: Vec<(u32, CompactCall)>,
+    recent_calls: Vec<CompactCall>,
 }
 
 impl HashTableInner {
@@ -117,16 +183,32 @@ impl HashTableInner {
                 .into_boxed_slice()
                 .try_into()
                 .expect("exact 4096 length"),
-            calls22: VecDeque::with_capacity(MAX_HASH22),
-            recent_calls: VecDeque::with_capacity(MAX_RECENT_CALLS),
+            calls22: Vec::with_capacity(MAX_HASH22),
+            recent_calls: Vec::with_capacity(MAX_RECENT_CALLS),
         }
     }
 
-    fn clear(&mut self) {
+    fn clear(&mut self) -> usize {
+        let count = self.entry_count();
         self.calls10.fill(None);
         self.calls12.fill(None);
         self.calls22.clear();
         self.recent_calls.clear();
+        count
+    }
+
+    #[inline]
+    fn entry_count(&self) -> usize {
+        self.calls22.len()
+    }
+
+    fn clone_into(&self, dst: &mut HashTableInner) {
+        dst.calls10.copy_from_slice(&self.calls10[..]);
+        dst.calls12.copy_from_slice(&self.calls12[..]);
+        dst.calls22.clear();
+        dst.calls22.extend_from_slice(&self.calls22);
+        dst.recent_calls.clear();
+        dst.recent_calls.extend_from_slice(&self.recent_calls);
     }
 
     fn save_call(&mut self, raw_call: &str, my_call: Option<&str>) -> Option<CallsignHashes> {
@@ -134,19 +216,20 @@ impl HashTableInner {
         let hashes = compute_all_hashes(&clean);
         let my_clean = my_call.map(|m| m.trim_end());
         let is_my_call = my_clean.is_some_and(|m| m == clean);
+        let compact = CompactCall::from_str_clean(&clean);
 
         if !is_my_call {
-            self.calls10[hashes.h10 as usize] = Some(clean.clone());
-            self.calls12[hashes.h12 as usize] = Some(clean.clone());
+            self.calls10[hashes.h10 as usize] = Some(compact);
+            self.calls12[hashes.h12 as usize] = Some(compact);
         }
 
         if let Some((_, existing)) = self.calls22.iter_mut().find(|(h, _)| *h == hashes.h22) {
-            *existing = clean;
+            *existing = compact;
         } else {
             if self.calls22.len() >= MAX_HASH22 {
-                self.calls22.pop_back();
+                self.calls22.pop();
             }
-            self.calls22.push_front((hashes.h22, clean));
+            self.calls22.insert(0, (hashes.h22, compact));
         }
 
         Some(hashes)
@@ -162,13 +245,91 @@ impl HashTableInner {
             .recent_calls
             .iter()
             .take(MAX_RECENT_CALLS - 1)
-            .any(|c| c == trimmed);
+            .any(|c| c.as_str() == trimmed);
         if !already_recent {
             if self.recent_calls.len() >= MAX_RECENT_CALLS {
-                self.recent_calls.pop_back();
+                self.recent_calls.pop();
             }
-            self.recent_calls.push_front(trimmed.to_string());
+            self.recent_calls
+                .insert(0, CompactCall::from_str_clean(trimmed));
         }
+    }
+}
+
+/// Lock-free immutable snapshot of `CallsignHashTable` reused across decode passes with zero heap allocations.
+#[derive(Debug, Clone)]
+pub struct PassHashSnapshot {
+    inner: HashTableInner,
+}
+
+impl Default for PassHashSnapshot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PassHashSnapshot {
+    pub fn new() -> Self {
+        Self {
+            inner: HashTableInner::new(),
+        }
+    }
+
+    #[inline]
+    pub fn lookup_10_str(&self, h10: u16) -> Option<&str> {
+        if h10 >= 1024 {
+            return None;
+        }
+        self.inner.calls10[h10 as usize].as_ref().map(CompactCall::as_str)
+    }
+
+    #[inline]
+    pub fn lookup_12_str(&self, h12: u16) -> Option<&str> {
+        if h12 >= 4096 {
+            return None;
+        }
+        self.inner.calls12[h12 as usize].as_ref().map(CompactCall::as_str)
+    }
+
+    #[inline]
+    pub fn lookup_22_str(&self, h22: u32) -> Option<&str> {
+        self.inner
+            .calls22
+            .iter()
+            .find(|(h, _)| *h == h22)
+            .map(|(_, c)| c.as_str())
+    }
+
+    #[inline]
+    pub fn format_10(&self, h10: u16) -> String {
+        CallsignLookup::format_10(self, h10)
+    }
+
+    #[inline]
+    pub fn format_12(&self, h12: u16) -> String {
+        CallsignLookup::format_12(self, h12)
+    }
+
+    #[inline]
+    pub fn format_22(&self, h22: u32) -> String {
+        CallsignLookup::format_22(self, h22)
+    }
+}
+
+impl CallsignLookup for PassHashSnapshot {
+    #[inline]
+    fn lookup_10(&self, h10: u16) -> Option<String> {
+        self.lookup_10_str(h10).map(str::to_string)
+    }
+
+    #[inline]
+    fn lookup_12(&self, h12: u16) -> Option<String> {
+        self.lookup_12_str(h12).map(str::to_string)
+    }
+
+    #[inline]
+    fn lookup_22(&self, h22: u32) -> Option<String> {
+        self.lookup_22_str(h22).map(str::to_string)
     }
 }
 
@@ -192,10 +353,34 @@ impl CallsignHashTable {
         }
     }
 
-    /// Clears all 10-, 12-, and 22-bit hash entries and recent calls.
-    pub fn clear(&self) {
+    /// Returns the number of tracked 22-bit hash entries in the current session.
+    pub fn len(&self) -> usize {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard.entry_count()
+    }
+
+    /// Returns true if no hash entries are stored.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Clears all 10-, 12-, and 22-bit hash entries and recent calls, returning entries cleared.
+    pub fn clear(&self) -> usize {
         let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
-        guard.clear();
+        guard.clear()
+    }
+
+    /// Snapshots the table into a caller-owned `PassHashSnapshot` without heap allocations.
+    pub fn snapshot_into(&self, dst: &mut PassHashSnapshot) {
+        let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        guard.clone_into(&mut dst.inner);
+    }
+
+    /// Allocates and returns a fresh immutable per-pass snapshot for lock-free worker reads.
+    pub fn snapshot(&self) -> PassHashSnapshot {
+        let mut snap = PassHashSnapshot::new();
+        self.snapshot_into(&mut snap);
+        snap
     }
 
     /// Exact port of `save_hash_call`: strips `<...>`, requires length >= 3,
@@ -211,7 +396,9 @@ impl CallsignHashTable {
             return None;
         }
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        guard.calls10[h10 as usize].clone()
+        guard.calls10[h10 as usize]
+            .as_ref()
+            .map(|c| c.as_str().to_string())
     }
 
     /// Looks up a 12-bit hash, returning the bare callsign without `<>` if present.
@@ -220,7 +407,9 @@ impl CallsignHashTable {
             return None;
         }
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        guard.calls12[h12 as usize].clone()
+        guard.calls12[h12 as usize]
+            .as_ref()
+            .map(|c| c.as_str().to_string())
     }
 
     /// Looks up a 22-bit hash, returning the bare callsign without `<>` if present.
@@ -230,7 +419,7 @@ impl CallsignHashTable {
             .calls22
             .iter()
             .find(|(h, _)| *h == h22)
-            .map(|(_, c)| c.clone())
+            .map(|(_, c)| c.as_str().to_string())
     }
 
     /// Formats a 10-bit hash lookup as `"<CALL>"` or `"<...>"`.
@@ -266,7 +455,11 @@ impl CallsignHashTable {
     /// Returns a snapshot of the recent callsign list (most recent first).
     pub fn recent_calls(&self) -> Vec<String> {
         let guard = self.inner.read().unwrap_or_else(|e| e.into_inner());
-        guard.recent_calls.iter().cloned().collect()
+        guard
+            .recent_calls
+            .iter()
+            .map(|c| c.as_str().to_string())
+            .collect()
     }
 
     /// Applies deferred hash updates emitted by `unpack77_readonly` in deterministic order.
@@ -281,6 +474,39 @@ impl CallsignHashTable {
         for call in &updates.save_calls {
             guard.save_call(call, my_call);
         }
+    }
+
+    /// Applies an ordered batch of deferred hash updates under one write lock for deterministic commit.
+    pub fn commit_updates_batch(&self, batches: &[&PendingHashUpdates], my_call: Option<&str>) {
+        if batches
+            .iter()
+            .all(|u| u.save_calls.is_empty() && u.recent_calls.is_empty())
+        {
+            return;
+        }
+        let mut guard = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        for updates in batches {
+            for call in &updates.recent_calls {
+                guard.add_recent(call);
+            }
+            for call in &updates.save_calls {
+                guard.save_call(call, my_call);
+            }
+        }
+    }
+}
+
+impl CallsignLookup for CallsignHashTable {
+    fn lookup_10(&self, h10: u16) -> Option<String> {
+        CallsignHashTable::lookup_10(self, h10)
+    }
+
+    fn lookup_12(&self, h12: u16) -> Option<String> {
+        CallsignHashTable::lookup_12(self, h12)
+    }
+
+    fn lookup_22(&self, h22: u32) -> Option<String> {
+        CallsignHashTable::lookup_22(self, h22)
     }
 }
 
@@ -367,5 +593,36 @@ mod tests {
             h.join().unwrap();
         }
         assert!(!ht.recent_calls().is_empty());
+    }
+
+    #[test]
+    fn snapshot_reuse_clear_count_and_batch_commit_determinism() {
+        let ht = CallsignHashTable::new();
+        assert_eq!(ht.len(), 0);
+        assert!(ht.is_empty());
+
+        let mut u0 = PendingHashUpdates::default();
+        u0.save_calls.push("PJ4/K1ABC".to_string());
+        let mut u1 = PendingHashUpdates::default();
+        u1.save_calls.push("KH1/KH7Z".to_string());
+        u1.recent_calls.push("KH1/KH7Z".to_string());
+
+        ht.commit_updates_batch(&[&u0, &u1], None);
+        assert_eq!(ht.len(), 2);
+
+        let mut snap = PassHashSnapshot::new();
+        ht.snapshot_into(&mut snap);
+        let h_k1 = compute_all_hashes("PJ4/K1ABC");
+        let h_kh = compute_all_hashes("KH1/KH7Z");
+        assert_eq!(snap.lookup_22_str(h_k1.h22), Some("PJ4/K1ABC"));
+        assert_eq!(snap.lookup_12_str(h_kh.h12), Some("KH1/KH7Z"));
+        assert_eq!(snap.format_22(h_k1.h22), "<PJ4/K1ABC>");
+
+        // Clearing returns exact previous entry count and empties snapshot on next copy.
+        assert_eq!(ht.clear(), 2);
+        assert_eq!(ht.len(), 0);
+        assert_eq!(ht.clear(), 0);
+        ht.snapshot_into(&mut snap);
+        assert_eq!(snap.lookup_22_str(h_k1.h22), None);
     }
 }

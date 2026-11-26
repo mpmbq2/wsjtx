@@ -8,6 +8,7 @@
 //! instead of Fortran `COMMON /boxes/`, and full-width `id..N` pivoting for guaranteed
 //! full-rank systematic reduction while preserving exact WSJT-X parity.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use crate::protocol::crc14::{compute_crc14, verify_crc14};
@@ -308,6 +309,22 @@ pub fn osd174_91(
     ndeep: u8,
     scratch: &mut OsdScratch,
 ) -> Option<OsdResult> {
+    let never_cancel = AtomicBool::new(false);
+    osd174_91_cancelable(llr, keff, apmask, ndeep, scratch, &never_cancel)
+}
+
+/// Cancel-aware Ordered Statistics Decoder (`osd174_91.f90`), checking `cancel` every 16 outer iterations.
+pub fn osd174_91_cancelable(
+    llr: &[f32; N_BITS],
+    keff: usize,
+    apmask: &[u8; N_BITS],
+    ndeep: u8,
+    scratch: &mut OsdScratch,
+    cancel: &AtomicBool,
+) -> Option<OsdResult> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
     if !(K_MIN..=K_MAX).contains(&keff) {
         return None;
     }
@@ -416,10 +433,15 @@ pub fn osd174_91(
             (1u128 << nt_clamped) - 1
         };
 
+        let mut iter_count = 0usize;
         for iorder in 1..=params.nord {
             let mut misub: u128 = ((1u128 << iorder) - 1) << (k - iorder);
             let mut iflag_opt = Some(k - iorder);
             while let Some(iflag) = iflag_opt {
+                if (iter_count & 0x0F) == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                iter_count += 1;
                 if (apmask_mrb & misub) == 0 {
                     let iend = if iorder == params.nord && params.npre1 == 0 {
                         iflag
@@ -487,6 +509,9 @@ pub fn osd174_91(
             boxes.reset(ntau);
 
             for i1 in (0..k).rev() {
+                if cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
                 for i2 in (0..i1).rev() {
                     let ipat = ((scratch.parity_rows[i1] ^ scratch.parity_rows[i2]) & pat_mask)
                         as usize;
@@ -506,7 +531,12 @@ pub fn osd174_91(
 
             let mut misub: u128 = ((1u128 << params.nord) - 1) << (k - params.nord);
             let mut iflag_opt = Some(k - params.nord);
+            let mut pre2_iter = 0usize;
             while let Some(_iflag) = iflag_opt {
+                if (pre2_iter & 0x0F) == 0 && cancel.load(Ordering::Relaxed) {
+                    return None;
+                }
+                pre2_iter += 1;
                 if (apmask_mrb & misub) == 0 {
                     let e2sub = e0_lrb ^ xor_parity_lrb(misub, &scratch.parity_rows[..k]);
                     let e2sub_tau = e2sub & pat_mask;
@@ -702,5 +732,14 @@ mod tests {
         let r_ext = osd174_91(&extreme, 91, &[0u8; N_BITS], 2, &mut scratch).unwrap();
         assert!(r_ext.crc_ok);
         assert_eq!(r_ext.cw, cw);
+    }
+
+    #[test]
+    fn osd174_91_aborts_on_cancellation_signal() {
+        let mut scratch = OsdScratch::new();
+        let llr = [0.1_f32; N_BITS];
+        let apmask = [0u8; N_BITS];
+        let cancelled = AtomicBool::new(true);
+        assert!(osd174_91_cancelable(&llr, 91, &apmask, 4, &mut scratch, &cancelled).is_none());
     }
 }

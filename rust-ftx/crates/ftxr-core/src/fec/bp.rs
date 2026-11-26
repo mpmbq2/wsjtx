@@ -5,6 +5,8 @@
 //! LDPC(174,91) Belief Propagation decoder (`decode174_91.f90`, `platanh.f90`,
 //! `ldpc_174_91_c_parity.f90`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::protocol::crc14::verify_crc14;
 use crate::telemetry::FecMethod;
 
@@ -143,11 +145,54 @@ pub struct BpDecodeOutput {
     pub final_unsatisfied_checks: usize,
 }
 
+/// Reusable scratch buffers for `bp_decode_174_91_with_scratch` (zero per-call heap allocations).
+#[derive(Debug, Clone)]
+pub struct BpScratch {
+    toc: [[f32; 7]; LDPC_M],
+    tov: [[f32; LDPC_COL_WEIGHT]; LDPC_N],
+    tanhtoc: [[f32; 7]; LDPC_M],
+    zn: [f32; LDPC_N],
+    zsum: [f32; LDPC_N],
+    cw: [u8; LDPC_N],
+}
+
+impl Default for BpScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BpScratch {
+    pub fn new() -> Self {
+        Self {
+            toc: [[0.0_f32; 7]; LDPC_M],
+            tov: [[0.0_f32; LDPC_COL_WEIGHT]; LDPC_N],
+            tanhtoc: [[0.0_f32; 7]; LDPC_M],
+            zn: [0.0_f32; LDPC_N],
+            zsum: [0.0_f32; LDPC_N],
+            cw: [0u8; LDPC_N],
+        }
+    }
+}
+
 /// Pure-Rust port of the Belief Propagation stage in `wsjtx/lib/ft8/decode174_91.f90`.
 pub fn bp_decode_174_91(
     llr: &[f32; LDPC_N],
     apmask: &[u8; LDPC_N],
     max_osd: i32,
+) -> BpDecodeOutput {
+    let mut scratch = BpScratch::new();
+    let never_cancel = AtomicBool::new(false);
+    bp_decode_174_91_with_scratch(llr, apmask, max_osd, &mut scratch, &never_cancel)
+}
+
+/// Cancel-aware, scratch-backed LDPC(174, 91) Belief Propagation decoder.
+pub fn bp_decode_174_91_with_scratch(
+    llr: &[f32; LDPC_N],
+    apmask: &[u8; LDPC_N],
+    max_osd: i32,
+    scratch: &mut BpScratch,
+    cancel: &AtomicBool,
 ) -> BpDecodeOutput {
     let max_osd_clamped = max_osd.min(3);
     let mut zsave = [[0.0_f32; LDPC_N]; 3];
@@ -160,9 +205,10 @@ pub fn bp_decode_174_91(
         0
     };
 
-    let mut toc = [[0.0_f32; 7]; LDPC_M];
-    let mut tov = [[0.0_f32; LDPC_COL_WEIGHT]; LDPC_N];
-    let mut tanhtoc = [[0.0_f32; 7]; LDPC_M];
+    let toc = &mut scratch.toc;
+    let tov = &mut scratch.tov;
+    let tanhtoc = &mut scratch.tanhtoc;
+    tov.fill([0.0_f32; LDPC_COL_WEIGHT]);
 
     for j in 0..LDPC_M {
         for i in 0..NRW[j] {
@@ -170,14 +216,25 @@ pub fn bp_decode_174_91(
         }
     }
 
-    let mut zn = [0.0_f32; LDPC_N];
-    let mut zsum = [0.0_f32; LDPC_N];
+    let zn = &mut scratch.zn;
+    let zsum = &mut scratch.zsum;
+    zsum.fill(0.0);
     let mut ncnt = 0usize;
     let mut nclast = 0usize;
     let mut iterations_run = 0usize;
     let mut final_unsatisfied_checks = LDPC_M;
+    let cw = &mut scratch.cw;
 
     for iter in 0..=BP_MAX_ITERS {
+        if cancel.load(Ordering::Relaxed) {
+            return BpDecodeOutput {
+                decoded: None,
+                zsave,
+                num_zsave: 0,
+                iterations_run,
+                final_unsatisfied_checks,
+            };
+        }
         iterations_run = iter + 1;
 
         for i in 0..LDPC_N {
@@ -189,10 +246,10 @@ pub fn bp_decode_174_91(
             zsum[i] += zn[i];
         }
         if iter > 0 && (iter as i32) <= max_osd_clamped {
-            zsave[iter - 1] = zsum;
+            zsave[iter - 1] = *zsum;
         }
 
-        let mut cw = [0u8; LDPC_N];
+        cw.fill(0);
         for i in 0..LDPC_N {
             if zn[i] > 0.0 {
                 cw[i] = 1;
@@ -230,10 +287,12 @@ pub fn bp_decode_174_91(
                 return BpDecodeOutput {
                     decoded: Some(LdpcDecoded {
                         message91,
-                        codeword: cw,
+                        codeword: *cw,
                         nhard_errors: nhard,
                         dmin,
-                        fec_method: FecMethod::BeliefPropagation,
+                        fec_method: FecMethod::Bp {
+                            iterations: iterations_run as u8,
+                        },
                     }),
                     zsave,
                     num_zsave,
@@ -369,7 +428,15 @@ mod tests {
         let dec = out.decoded.expect("BP should recover 12-error codeword");
         assert_eq!(dec.codeword, cw);
         assert_eq!(dec.nhard_errors, 12);
-        assert_eq!(dec.fec_method, FecMethod::BeliefPropagation);
+        assert!(matches!(dec.fec_method, FecMethod::Bp { iterations } if iterations >= 1));
+
+        // Pre-cancelled decode aborts immediately with None and zero iterations.
+        let cancelled = AtomicBool::new(true);
+        let mut scratch = BpScratch::new();
+        let abort_out =
+            bp_decode_174_91_with_scratch(&llr, &apmask, 2, &mut scratch, &cancelled);
+        assert!(abort_out.decoded.is_none());
+        assert_eq!(abort_out.iterations_run, 0);
 
         // Also verify 20 flipped bits with soft LLR magnitudes (like AWGN fading).
         let mut soft_llr = [0.0_f32; LDPC_N];

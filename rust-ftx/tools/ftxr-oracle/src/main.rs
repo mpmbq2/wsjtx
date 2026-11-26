@@ -4,18 +4,21 @@
 
 //! Development-only WSJT-X oracle harness (`ftxr-oracle`).
 //!
-//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`, `osd-oracle`, `ft8-stage3`, `ft4-stage4`.
+//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`, `osd-oracle`, `ft8-stage3`, `ft4-stage4`, `bench-3pass`, `soak`.
 
+mod bench_3pass;
 mod codec_oracle;
 mod corpus;
 mod ft4_stage4;
 mod ft8_mvp_bench;
 mod ft8_stage3;
+mod ipc_client;
 mod jt9;
 mod osd_oracle;
 mod scorecard;
 mod sim;
 mod smoke;
+mod soak;
 mod stage2_verify;
 mod synth;
 mod tx_loopback;
@@ -283,6 +286,39 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+
+    /// Execute Stage 5 warm stdio IPC 3-pass latency and jt9 parity benchmark.
+    #[command(name = "bench-3pass")]
+    Bench3Pass {
+        /// Optional path to `ftxr-modem` binary (defaults to release or debug build in workspace target/).
+        #[arg(long)]
+        modem_bin: Option<PathBuf>,
+        /// Worker decode thread count override (defaults to worker auto-sizing).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Timed repetitions per pass/fixture (default 5).
+        #[arg(long, default_value_t = 5)]
+        repeats: usize,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Execute Stage 5 continuous warm `--worker` endurance soak harness (1,000 slots default).
+    Soak {
+        /// Optional path to `ftxr-modem` binary (defaults to release or debug build in workspace target/).
+        #[arg(long)]
+        modem_bin: Option<PathBuf>,
+        /// Worker decode thread count override (defaults to worker auto-sizing).
+        #[arg(long)]
+        threads: Option<usize>,
+        /// Number of slots to execute continuously (default 1000).
+        #[arg(long, default_value_t = 1000)]
+        slots: usize,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn default_rust_ftx_root() -> PathBuf {
@@ -537,6 +573,107 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 &opts,
                 out.as_deref(),
             )?;
+        }
+        Commands::Bench3Pass {
+            modem_bin,
+            threads,
+            repeats,
+            out,
+        } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let resolved_bin_dir = sim.bin_path("jt9").parent().unwrap().to_path_buf();
+            let jt9 = Jt9Runner::new(resolved_bin_dir, cache_dir);
+            let report = bench_3pass::run_bench_3pass(
+                &wsjtx_root,
+                &rust_ftx_root,
+                &jt9,
+                modem_bin.as_deref(),
+                threads,
+                repeats,
+                out.as_deref(),
+            )?;
+            println!(
+                "Stage 5 bench-3pass complete (host_cpus={}, worker_threads={}, version={}):",
+                report.host_cpus, report.worker_threads, report.worker_version
+            );
+            for f in &report.fixtures {
+                println!("  Fixture {} ({:?}):", f.fixture_id, f.mode);
+                for p in &f.passes {
+                    let jt9_str = match (p.jt9_decodes, &p.jt9_stats_ms) {
+                        (Some(d), Some(st)) => format!(
+                            " | jt9: dec={} med={:.2}ms p95={:.2}ms",
+                            d, st.median, st.p95
+                        ),
+                        _ => String::new(),
+                    };
+                    println!(
+                        "    {} (n={}): rust dec={} med={:.2}ms p95={:.2}ms{}",
+                        p.label,
+                        p.samples_12k,
+                        p.rust_decodes,
+                        p.rust_stats_ms.median,
+                        p.rust_stats_ms.p95,
+                        jt9_str
+                    );
+                }
+            }
+            println!(
+                "  Telemetry overhead (Pass 3): off={:.2}ms on={:.2}ms ({:+.2}%)",
+                report.telemetry_disabled_ms.median,
+                report.telemetry_enabled_ms.median,
+                report.telemetry_overhead_pct
+            );
+            println!(
+                "  Concurrent encode_tx latency: med={:.2}ms p95={:.2}ms max={:.2}ms (n={})",
+                report.concurrent_encode_tx_ms.median,
+                report.concurrent_encode_tx_ms.p95,
+                report.concurrent_encode_tx_ms.max,
+                report.concurrent_encode_tx_ms.count
+            );
+            if let (Some(rss), Some(th)) = (report.worker_rss_after_kb, report.worker_threads_after) {
+                println!("  Worker after bench: VmRSS={} kB, Threads={}", rss, th);
+            }
+        }
+        Commands::Soak {
+            modem_bin,
+            threads,
+            slots,
+            out,
+        } => {
+            let report = soak::run_soak(
+                &wsjtx_root,
+                &rust_ftx_root,
+                modem_bin.as_deref(),
+                threads,
+                slots,
+                out.as_deref(),
+            )?;
+            println!(
+                "Stage 5 soak complete ({} slots in {:.1}s, threads={}): ft8={}, ft4={}, decodes={}",
+                report.slots_executed,
+                report.elapsed_total_ms / 1000.0,
+                report.worker_threads,
+                report.ft8_slots,
+                report.ft4_slots,
+                report.total_decodes
+            );
+            println!(
+                "  cancels_ok={}, max_cancel_wall_ms={:.2}, concurrent_tx_ok={}, error_recoveries_ok={}, resets={}",
+                report.cancellations_ok,
+                report.max_cancel_wall_ms,
+                report.concurrent_tx_ok,
+                report.error_recoveries_ok,
+                report.session_resets
+            );
+            println!(
+                "  VmRSS warmed={} kB end={} kB growth={:+.2} MiB | Threads range={}..{} | exit={:?}",
+                report.rss_warmed_kb,
+                report.rss_end_kb,
+                report.rss_growth_mb,
+                report.threads_min,
+                report.threads_max,
+                report.exit_code
+            );
         }
     }
 

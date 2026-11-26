@@ -7,18 +7,21 @@
 
 use std::f32::consts::TAU;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use num_complex::Complex32;
 
 use crate::dsp::downsample::{Ft8Downsampler, Ft8SpectrumSnapshot};
 use crate::dsp::fft::Ft8FftPlans;
 use crate::fec::bp::LDPC_N;
-use crate::fec::decode174_91::decode174_91;
-use crate::fec::osd::OsdScratch;
+use crate::fec::decode174_91::{decode174_91_with_scratch, FecScratch};
 use crate::modulate::ft8::encode_ft8_tones_from_77bits;
-use crate::protocol::hashtable::CallsignHashTable;
+use crate::protocol::hashtable::{CallsignHashTable, CallsignLookup};
 use crate::protocol::types::{PendingHashUpdates, UnpackContext, UnpackMode, PAYLOAD_BITS};
 use crate::protocol::unpack77::unpack77_readonly;
-use crate::telemetry::FecMethod;
+use crate::telemetry::{
+    compute_ft8_symbol_envelope, estimate_ft8_costas_drift, FecMethod, SymbolEnvelope,
+};
 use crate::{ApTag, QsoContext};
 
 use super::ap::{apply_ap_hypothesis, ft8b_pass_count, ft8b_pass_plan, ApSeed, Ft8bPassPlan};
@@ -36,7 +39,7 @@ pub struct Ft8bScratch {
     pub s2: [f32; 512],
     pub llrz: [f32; LDPC_N],
     pub apmask: [u8; LDPC_N],
-    pub osd_scratch: OsdScratch,
+    pub fec_scratch: FecScratch,
 }
 
 impl Ft8bScratch {
@@ -50,7 +53,7 @@ impl Ft8bScratch {
             s2: [0.0; 512],
             llrz: [0.0; LDPC_N],
             apmask: [0u8; LDPC_N],
-            osd_scratch: OsdScratch::new(),
+            fec_scratch: FecScratch::new(),
         }
     }
 }
@@ -103,10 +106,13 @@ pub struct Ft8bOutcome {
     pub ap_tag: ApTag,
     pub fec_method: FecMethod,
     pub message: String,
+    pub message77: [u8; PAYLOAD_BITS],
     pub i3: u8,
     pub n3: u8,
     pub itone: [u8; NN],
     pub pending_hashes: PendingHashUpdates,
+    pub freq_drift_hz: Option<f32>,
+    pub qsb_envelope: Option<SymbolEnvelope>,
 }
 
 /// Computes unnormalized 1-symbol soft-bit LLRs `bmeta[0..174]` from symbol spectra `cs`.
@@ -482,6 +488,60 @@ pub fn ft8b_decode_candidate_with_ap(
     hash_table: &CallsignHashTable,
     scratch: &mut Ft8bScratch,
 ) -> Option<Ft8bOutcome> {
+    let never_cancel = AtomicBool::new(false);
+    ft8b_decode_candidate_with_options(
+        snapshot,
+        cand,
+        xbase,
+        depth,
+        nzhsym,
+        metric_mode,
+        nagain,
+        ncontest,
+        qso,
+        ap_seed,
+        plans,
+        downsampler,
+        sync8d_tables,
+        unpack_ctx,
+        hash_table,
+        scratch,
+        &never_cancel,
+        false,
+        crate::ft8::params::NMAX,
+        false,
+    )
+}
+
+/// Cancel-aware, lock-free FT8 candidate decoder supporting generic `CallsignLookup` and
+/// strictly gated optional telemetry computation.
+#[allow(clippy::too_many_arguments)]
+pub fn ft8b_decode_candidate_with_options<H: CallsignLookup + ?Sized>(
+    snapshot: &Ft8SpectrumSnapshot,
+    cand: &Ft8Candidate,
+    xbase: f32,
+    depth: u8,
+    nzhsym: u8,
+    metric_mode: BitMetricMode,
+    nagain: bool,
+    ncontest: u8,
+    qso: Option<&QsoContext>,
+    ap_seed: &ApSeed,
+    plans: &Ft8FftPlans,
+    downsampler: &Ft8Downsampler,
+    sync8d_tables: &Sync8dTables,
+    unpack_ctx: &UnpackContext,
+    hash_table: &H,
+    scratch: &mut Ft8bScratch,
+    cancel: &AtomicBool,
+    enable_telemetry: bool,
+    active_samples_12k: usize,
+    early_pass: bool,
+) -> Option<Ft8bOutcome> {
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     let inter = ft8b_extract_stage2_intermediates(
         snapshot,
         cand,
@@ -493,13 +553,26 @@ pub fn ft8b_decode_candidate_with_ap(
         scratch,
     )?;
 
+    if cancel.load(Ordering::Relaxed) {
+        return None;
+    }
+
     let metrics = compute_all_bit_metrics(&scratch.cs, metric_mode, &mut scratch.s2);
     let npasses = ft8b_pass_count(qso, nzhsym);
-    let maxosd: i32 = if depth <= 1 { -1 } else { 2 };
+    let maxosd: i32 = if depth <= 1 {
+        -1
+    } else if early_pass {
+        1
+    } else {
+        2
+    };
     let norder: u8 = 2;
 
     let mut hit = None;
     for ipass in 1..=npasses {
+        if cancel.load(Ordering::Relaxed) {
+            return None;
+        }
         let iaptype: u8 = match ft8b_pass_plan(ipass, qso) {
             Ft8bPassPlan::NonAp { metric_idx } => {
                 scratch.apmask.fill(0);
@@ -531,13 +604,14 @@ pub fn ft8b_decode_candidate_with_ap(
             }
         };
 
-        let Some(decoded) = decode174_91(
+        let Some(decoded) = decode174_91_with_scratch(
             &scratch.llrz,
             91,
             maxosd,
             norder,
             &scratch.apmask,
-            &mut scratch.osd_scratch,
+            &mut scratch.fec_scratch,
+            cancel,
         ) else {
             continue;
         };
@@ -606,6 +680,20 @@ pub fn ft8b_decode_candidate_with_ap(
     let qual = 1.0 - (decoded.nhard_errors as f32 + decoded.dmin) / 60.0;
     let ap_tag = ApTag::from_wsjtx(iaptype, qual);
 
+    let (freq_drift_hz, qsb_envelope) = if enable_telemetry {
+        let drift = estimate_ft8_costas_drift(&scratch.cd0, inter.ibest, active_samples_12k);
+        let env = compute_ft8_symbol_envelope(
+            &scratch.cd0,
+            inter.ibest,
+            &itone,
+            drift,
+            active_samples_12k,
+        );
+        (drift, env)
+    } else {
+        (None, None)
+    };
+
     Some(Ft8bOutcome {
         freq_hz: inter.f1_refined_hz,
         dt_raw_sec: inter.dt_raw_sec,
@@ -619,10 +707,13 @@ pub fn ft8b_decode_candidate_with_ap(
         ap_tag,
         fec_method: decoded.fec_method,
         message: unpacked.text,
+        message77,
         i3,
         n3,
         itone,
         pending_hashes: unpacked.pending_hashes,
+        freq_drift_hz,
+        qsb_envelope,
     })
 }
 

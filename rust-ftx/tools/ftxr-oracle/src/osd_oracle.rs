@@ -666,7 +666,7 @@ pub fn run_suite_a_osd_oracle(
             }
             (ntype @ (1 | 2), Some(dec)) => {
                 let r_ntype = match dec.fec_method {
-                    FecMethod::BeliefPropagation => 1,
+                    FecMethod::Bp { .. } => 1,
                     FecMethod::Osd { .. } => 2,
                 };
                 let rel_err = (f64::from(dec.dmin) - f64::from(f.dmin)).abs()

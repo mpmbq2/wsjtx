@@ -2,6 +2,8 @@
 // Copyright (C) 2026 ftxr-modem Contributors
 // Based on WSJT-X algorithms (Copyright (C) 2001-2026 WSJT Development Group).
 
+#![forbid(unsafe_code)]
+
 //! Pure-Rust FT8 and FT4 modem core library.
 //!
 //! Stage 0 provides the stable public API contract, verified protocol constants,
@@ -139,6 +141,16 @@ pub struct DecodeConfig {
     pub qso: Option<QsoContext>,
     pub enable_telemetry: bool,
     pub max_threads: Option<usize>,
+    /// True during live partial passes (e.g. 11.8s / 13.5s) to bound pass depth for low latency.
+    #[serde(default)]
+    pub early_pass: bool,
+    /// True (default) to decode Tier 0 (`|f - rx_freq_hz| <= freq_tol_hz`) before Tier 1.
+    #[serde(default = "default_true")]
+    pub qso_first: bool,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 impl DecodeConfig {
@@ -154,6 +166,8 @@ impl DecodeConfig {
             qso: None,
             enable_telemetry: false,
             max_threads: None,
+            early_pass: false,
+            qso_first: true,
         }
     }
 }
@@ -312,22 +326,121 @@ pub enum FtxrError {
     Internal(String),
 }
 
-/// Stateful, thread-safe FT8/FT4 modem engine (TX implemented in Stage 1; FT8 RX in Stage 2; FT4 RX in Stage 4).
-#[derive(Debug, Default)]
+/// Recommended worker thread count on the host machine, reserving I/O headroom when available.
+pub fn recommended_worker_threads() -> usize {
+    let avail = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    if avail <= 2 {
+        avail
+    } else if avail <= 4 {
+        avail - 1
+    } else {
+        (avail - 2).clamp(1, 8)
+    }
+}
+
+/// Stateful, thread-safe FT8/FT4 modem engine holding warm FFT plans, precomputed DSP/FEC tables,
+/// RAII scratch pools, a session callsign hash table, and a private Rayon RX worker pool.
 pub struct DecoderEngine {
     hash_table: protocol::hashtable::CallsignHashTable,
-    ft8_decoder: ft8::decoder::Ft8Decoder,
-    ft4_decoder: ft4::decoder::Ft4Decoder,
+    fft_plans: std::sync::Arc<dsp::FftPlanCache>,
+    tables: std::sync::Arc<dsp::PrecomputedTables>,
+    pass_pool: dsp::PassScratchPool,
+    cand_pool: dsp::CandidateScratchPool,
+    rx_pool: std::sync::Arc<rayon::ThreadPool>,
+    rx_threads: usize,
+    override_pool: std::sync::Mutex<Option<(usize, std::sync::Arc<rayon::ThreadPool>)>>,
+    legacy_ft8: Option<Box<ft8::decoder::Ft8Decoder>>,
+    legacy_ft4: Option<Box<ft4::decoder::Ft4Decoder>>,
+}
+
+impl std::fmt::Debug for DecoderEngine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecoderEngine")
+            .field("rx_threads", &self.rx_threads)
+            .field("hash_entries", &self.hash_table.len())
+            .field("pass_pool", &self.pass_pool)
+            .field("cand_pool", &self.cand_pool)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for DecoderEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn build_rx_thread_pool(threads: usize) -> Result<std::sync::Arc<rayon::ThreadPool>, FtxrError> {
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .thread_name(|idx| format!("ftxr-rx-{idx}"))
+        .build()
+        .map_err(|e| FtxrError::Internal(format!("failed to create rayon pool: {e}")))?;
+    Ok(std::sync::Arc::new(pool))
 }
 
 impl DecoderEngine {
-    /// Creates a new modem engine instance with warm FFT plans and an empty session callsign hash table.
+    /// Creates a new modem engine with warm FFT plans, auto-sized worker pool, and empty hash table.
     pub fn new() -> Self {
-        Self {
+        Self::with_threads(None).expect("auto rayon thread pool must initialize")
+    }
+
+    /// Creates a new modem engine configured for `threads` RX worker threads (`None` uses auto heuristic).
+    pub fn with_threads(threads: Option<usize>) -> Result<Self, FtxrError> {
+        let rx_threads = match threads {
+            Some(0) => {
+                return Err(FtxrError::InvalidConfig(
+                    "threads must be >= 1".to_string(),
+                ));
+            }
+            Some(n) => n.clamp(1, 32),
+            None => recommended_worker_threads(),
+        };
+
+        let fft_plans = std::sync::Arc::new(dsp::FftPlanCache::new());
+        let tables = std::sync::Arc::new(dsp::PrecomputedTables::new(std::sync::Arc::clone(
+            &fft_plans,
+        )));
+        let pass_pool = dsp::PassScratchPool::new(std::sync::Arc::clone(&fft_plans));
+        let cand_pool = dsp::CandidateScratchPool::new(std::sync::Arc::clone(&fft_plans));
+        pass_pool.prewarm(1);
+        cand_pool.prewarm(rx_threads);
+        let rx_pool = build_rx_thread_pool(rx_threads)?;
+
+        Ok(Self {
             hash_table: protocol::hashtable::CallsignHashTable::new(),
-            ft8_decoder: ft8::decoder::Ft8Decoder::new(),
-            ft4_decoder: ft4::decoder::Ft4Decoder::new(),
-        }
+            fft_plans,
+            tables,
+            pass_pool,
+            cand_pool,
+            rx_pool,
+            rx_threads,
+            override_pool: std::sync::Mutex::new(None),
+            legacy_ft8: None,
+            legacy_ft4: None,
+        })
+    }
+
+    /// Returns the default number of RX worker threads in this engine's pool.
+    pub fn num_threads(&self) -> usize {
+        self.rx_threads
+    }
+
+    /// Returns the number of pass-level scratch workspaces allocated in `PassScratchPool`.
+    pub fn pass_pool_created(&self) -> usize {
+        self.pass_pool.created_count()
+    }
+
+    /// Returns the number of candidate-level scratch workspaces allocated in `CandidateScratchPool`.
+    pub fn cand_pool_created(&self) -> usize {
+        self.cand_pool.created_count()
+    }
+
+    /// Returns a reference to the shared warm FFT plan cache.
+    pub fn fft_plans(&self) -> &dsp::FftPlanCache {
+        &self.fft_plans
     }
 
     /// Returns a reference to the session-scoped callsign hash table.
@@ -335,24 +448,58 @@ impl DecoderEngine {
         &self.hash_table
     }
 
-    /// Returns a reference to the pre-allocated FT8 decoder (for advanced/oracle options).
+    /// Returns a reference to a lazy-initialized legacy FT8 decoder (prefer `&self` methods on `DecoderEngine`).
     pub fn ft8_decoder_mut(&mut self) -> &mut ft8::decoder::Ft8Decoder {
-        &mut self.ft8_decoder
+        self.legacy_ft8
+            .get_or_insert_with(|| Box::new(ft8::decoder::Ft8Decoder::new()))
     }
 
-    /// Returns a reference to the pre-allocated FT4 decoder (for advanced/oracle options).
+    /// Returns a reference to a lazy-initialized legacy FT4 decoder (prefer `&self` methods on `DecoderEngine`).
     pub fn ft4_decoder_mut(&mut self) -> &mut ft4::decoder::Ft4Decoder {
-        &mut self.ft4_decoder
+        self.legacy_ft4
+            .get_or_insert_with(|| Box::new(ft4::decoder::Ft4Decoder::new()))
     }
 
-    /// Clears session-scoped state (callsign hash tables) between bands or operating sessions.
-    pub fn reset_session(&mut self) {
-        self.hash_table.clear();
+    /// Clears session-scoped state (callsign hash tables) between bands or operating sessions,
+    /// returning the number of callsign hash entries cleared.
+    pub fn reset_session(&self) -> usize {
+        self.hash_table.clear()
+    }
+
+    fn resolve_pool(
+        &self,
+        override_threads: Option<usize>,
+    ) -> Result<std::sync::Arc<rayon::ThreadPool>, FtxrError> {
+        let Some(n) = override_threads else {
+            return Ok(std::sync::Arc::clone(&self.rx_pool));
+        };
+        if n == 0 {
+            return Err(FtxrError::InvalidConfig(
+                "max_threads must be >= 1".to_string(),
+            ));
+        }
+        let n = n.clamp(1, 32);
+        if n == self.rx_threads {
+            return Ok(std::sync::Arc::clone(&self.rx_pool));
+        }
+        self.cand_pool.prewarm(n);
+        let mut guard = self
+            .override_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((cached_n, ref cached_pool)) = *guard {
+            if cached_n == n {
+                return Ok(std::sync::Arc::clone(cached_pool));
+            }
+        }
+        let pool = build_rx_thread_pool(n)?;
+        *guard = Some((n, std::sync::Arc::clone(&pool)));
+        Ok(pool)
     }
 
     /// Decodes a 12 kHz mono normalized `f32` (`[-1.0, 1.0]`) baseband PCM buffer.
     pub fn decode(
-        &mut self,
+        &self,
         samples_12k: &[f32],
         cfg: &DecodeConfig,
     ) -> Result<Vec<DecodedMessage>, FtxrError> {
@@ -363,7 +510,7 @@ impl DecoderEngine {
     /// Decodes a 12 kHz mono normalized `f32` (`[-1.0, 1.0]`) baseband PCM buffer,
     /// streaming decodes via `on_decode` and honoring `cancel`.
     pub fn decode_streaming<F>(
-        &mut self,
+        &self,
         samples_12k: &[f32],
         cfg: &DecodeConfig,
         cancel: &AtomicBool,
@@ -372,20 +519,71 @@ impl DecoderEngine {
     where
         F: FnMut(DecodedMessage),
     {
+        let pool = self.resolve_pool(cfg.max_threads)?;
         match cfg.mode {
-            Mode::Ft8 => self.ft8_decoder.decode_f32(
+            Mode::Ft8 => ft8::decoder::decode_ft8_shared_f32(
                 samples_12k,
                 cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
                 &self.hash_table,
                 cancel,
                 ft8::decoder::Ft8DecodeOptions::default(),
                 on_decode,
             ),
-            Mode::Ft4 => self.ft4_decoder.decode_f32(
+            Mode::Ft4 => ft4::decoder::decode_ft4_shared_f32(
                 samples_12k,
                 cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
                 &self.hash_table,
-                Some(cancel),
+                cancel,
+                ft4::decoder::Ft4DecodeOptions::default(),
+                on_decode,
+            ),
+        }
+    }
+
+    /// Decodes a 12 kHz mono normalized `f32` PCM buffer with explicit `Ft8DecodeOptions`
+    /// (e.g., `wsjtx_three_stage` for crowded disk WAVs vs single-shot live partial passes).
+    pub fn decode_f32_with_ft8_options<F>(
+        &self,
+        samples_12k: &[f32],
+        cfg: &DecodeConfig,
+        cancel: &AtomicBool,
+        ft8_opts: ft8::decoder::Ft8DecodeOptions,
+        on_decode: F,
+    ) -> Result<Vec<DecodedMessage>, FtxrError>
+    where
+        F: FnMut(DecodedMessage),
+    {
+        let pool = self.resolve_pool(cfg.max_threads)?;
+        match cfg.mode {
+            Mode::Ft8 => ft8::decoder::decode_ft8_shared_f32(
+                samples_12k,
+                cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
+                &self.hash_table,
+                cancel,
+                ft8_opts,
+                on_decode,
+            ),
+            Mode::Ft4 => ft4::decoder::decode_ft4_shared_f32(
+                samples_12k,
+                cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
+                &self.hash_table,
+                cancel,
                 ft4::decoder::Ft4DecodeOptions::default(),
                 on_decode,
             ),
@@ -394,7 +592,7 @@ impl DecoderEngine {
 
     /// Decodes a 12 kHz mono signed 16-bit (`i16`) PCM buffer with exact `jt9` scaling (`s as f32`).
     pub fn decode_i16(
-        &mut self,
+        &self,
         samples_12k: &[i16],
         cfg: &DecodeConfig,
     ) -> Result<Vec<DecodedMessage>, FtxrError> {
@@ -404,7 +602,7 @@ impl DecoderEngine {
 
     /// Decodes a 12 kHz mono signed 16-bit (`i16`) PCM buffer, streaming decodes via `on_decode`.
     pub fn decode_i16_streaming<F>(
-        &mut self,
+        &self,
         samples_12k: &[i16],
         cfg: &DecodeConfig,
         cancel: &AtomicBool,
@@ -413,20 +611,29 @@ impl DecoderEngine {
     where
         F: FnMut(DecodedMessage),
     {
+        let pool = self.resolve_pool(cfg.max_threads)?;
         match cfg.mode {
-            Mode::Ft8 => self.ft8_decoder.decode_i16(
+            Mode::Ft8 => ft8::decoder::decode_ft8_shared_i16(
                 samples_12k,
                 cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
                 &self.hash_table,
                 cancel,
                 ft8::decoder::Ft8DecodeOptions::default(),
                 on_decode,
             ),
-            Mode::Ft4 => self.ft4_decoder.decode_i16(
+            Mode::Ft4 => ft4::decoder::decode_ft4_shared_i16(
                 samples_12k,
                 cfg,
+                &self.tables,
+                &self.pass_pool,
+                &self.cand_pool,
+                Some(pool.as_ref()),
                 &self.hash_table,
-                Some(cancel),
+                cancel,
                 ft4::decoder::Ft4DecodeOptions::default(),
                 on_decode,
             ),
@@ -434,8 +641,10 @@ impl DecoderEngine {
     }
 
     /// Encodes and GFSK-modulates an FT8 or FT4 message into mono `f32` PCM samples.
+    ///
+    /// Thread-safe and lock-free with respect to active parallel RX candidate decoding.
     pub fn modulate(
-        &mut self,
+        &self,
         message: &str,
         cfg: &ModulateConfig,
     ) -> Result<Vec<f32>, FtxrError> {
@@ -564,7 +773,7 @@ mod tests {
 
     #[test]
     fn ft8_and_ft4_modulate_and_decode_roundtrip() {
-        let mut engine = DecoderEngine::new();
+        let engine = DecoderEngine::new();
         let mut cfg_ft4 = DecodeConfig::for_mode(Mode::Ft4);
         cfg_ft4.depth = 1;
         assert!(engine.decode(&[], &cfg_ft4).unwrap().is_empty());
@@ -592,5 +801,129 @@ mod tests {
         assert_eq!(decoded[0].message, "CQ N0AAA EM10");
         assert!((decoded[0].af_hz - 1500.0).abs() < 1.0);
         assert!(decoded[0].dt_sec.abs() < 0.05);
+    }
+
+    #[test]
+    fn parallel_determinism_pool_reuse_concurrent_tx_and_fast_cancel() {
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        let engine_synth = DecoderEngine::with_threads(Some(1)).unwrap();
+
+        // Build multi-signal crowded FT8 and FT4 slots cleanly.
+        let mut ft8_mix = vec![0.0_f32; ft8::params::NMAX];
+        for (idx, (msg, af)) in [
+            ("CQ K1ABC FN42", 1500.0),
+            ("CQ W9XYZ EN52", 1620.0),
+            ("K1ABC W9XYZ -10", 1850.0),
+            ("CQ PJ4/N0AAA FK52", 1200.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut mcfg = ModulateConfig::default_for(Mode::Ft8, af, 12_000);
+            mcfg.offset_ms = (idx as u64) * 40;
+            let wave = engine_synth.modulate(msg, &mcfg).unwrap();
+            let scale = if idx == 0 { 0.35 } else { 0.25 };
+            for (dst, &s) in ft8_mix.iter_mut().zip(wave.iter()) {
+                *dst += s * scale;
+            }
+        }
+
+        let mut ft4_mix = vec![0.0_f32; ft4::params::NMAX];
+        for (idx, (msg, af)) in [
+            ("CQ K1ABC FN42", 1500.0),
+            ("CQ W9XYZ EN52", 1740.0),
+            ("K1ABC W9XYZ RR73", 1310.0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut mcfg = ModulateConfig::default_for(Mode::Ft4, af, 12_000);
+            mcfg.offset_ms = (idx as u64) * 20;
+            let wave = engine_synth.modulate(msg, &mcfg).unwrap();
+            for (dst, &s) in ft4_mix.iter_mut().zip(wave.iter()) {
+                *dst += s * 0.25;
+            }
+        }
+
+        // 1. Determinism across thread counts 1, 2, 4, 8 (with telemetry enabled!)
+        let mut ref_ft8 = None;
+        let mut ref_ft4 = None;
+        for &threads in &[1usize, 2, 4, 8] {
+            let eng = DecoderEngine::with_threads(Some(threads)).unwrap();
+            let mut cfg8 = DecodeConfig::for_mode(Mode::Ft8);
+            cfg8.depth = 3;
+            cfg8.enable_telemetry = true;
+            let d8 = eng.decode(&ft8_mix, &cfg8).unwrap();
+            assert_eq!(d8.len(), 4, "threads={threads} ft8={d8:?}");
+            match &ref_ft8 {
+                None => ref_ft8 = Some(d8),
+                Some(prev) => assert_eq!(prev, &d8, "FT8 determinism mismatch for threads={threads}"),
+            }
+
+            let mut cfg4 = DecodeConfig::for_mode(Mode::Ft4);
+            cfg4.depth = 3;
+            cfg4.enable_telemetry = true;
+            let d4 = eng.decode(&ft4_mix, &cfg4).unwrap();
+            assert_eq!(d4.len(), 3, "threads={threads} ft4={d4:?}");
+            match &ref_ft4 {
+                None => ref_ft4 = Some(d4),
+                Some(prev) => assert_eq!(prev, &d4, "FT4 determinism mismatch for threads={threads}"),
+            }
+        }
+
+        // 2. Steady-state scratch pool reuse across 8 consecutive slots (0 pool growth)
+        let eng4 = Arc::new(DecoderEngine::with_threads(Some(2)).unwrap());
+        assert_eq!(eng4.pass_pool_created(), 1);
+        assert_eq!(eng4.cand_pool_created(), 2);
+        let cfg8_notelem = DecodeConfig::for_mode(Mode::Ft8);
+        for _ in 0..4 {
+            let _ = eng4.decode(&ft8_mix, &cfg8_notelem).unwrap();
+            let _ = eng4.decode(&ft4_mix, &DecodeConfig::for_mode(Mode::Ft4)).unwrap();
+        }
+        assert_eq!(eng4.pass_pool_created(), 1);
+        assert_eq!(eng4.cand_pool_created(), 2);
+
+        // 3. Concurrent TX modulate + RX decode sharing Arc<DecoderEngine>, plus <50ms cancel response
+        let mut noisy = vec![0.0_f32; ft8::params::NMAX];
+        let mut rng: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        for s in &mut noisy {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *s = (((rng >> 33) as f32) / (u32::MAX as f32) - 0.5) * 0.4;
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let eng_rx = Arc::clone(&eng4);
+        let cancel_rx = Arc::clone(&cancel);
+        let rx_handle = std::thread::spawn(move || {
+            let cfg = DecodeConfig::for_mode(Mode::Ft8);
+            eng_rx.decode_streaming(&noisy, &cfg, &cancel_rx, |_| {})
+        });
+
+        std::thread::sleep(Duration::from_millis(3));
+        let tx_t0 = Instant::now();
+        let tx_wave = eng4
+            .modulate(
+                "CQ N0AAA EM10",
+                &ModulateConfig::default_for(Mode::Ft8, 1500.0, 12_000),
+            )
+            .unwrap();
+        assert!(!tx_wave.is_empty());
+        assert!(tx_t0.elapsed() < Duration::from_secs(1));
+
+        let c_t0 = Instant::now();
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let rx_res = rx_handle.join().unwrap();
+        let c_elapsed = c_t0.elapsed();
+        assert!(matches!(rx_res, Err(FtxrError::Cancelled)));
+        let cancel_limit = if cfg!(debug_assertions) {
+            Duration::from_secs(2)
+        } else {
+            Duration::from_millis(50)
+        };
+        assert!(
+            c_elapsed < cancel_limit,
+            "cancel took {c_elapsed:?} (limit {cancel_limit:?})"
+        );
     }
 }

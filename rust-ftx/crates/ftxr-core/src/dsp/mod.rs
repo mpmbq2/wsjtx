@@ -7,5 +7,11 @@
 pub mod baseline;
 pub mod downsample;
 pub mod fft;
+pub mod pool;
 pub mod twkfreq;
 pub mod window;
+
+pub use pool::{
+    CandidateScratch, CandidateScratchPool, FftPlanCache, PassScratch, PassScratchPool,
+    PooledCandidateScratch, PooledPassScratch, PrecomputedTables,
+};

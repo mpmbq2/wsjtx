@@ -10,15 +10,19 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dsp::downsample::{DownsampleSnapshotScratch, Ft8Downsampler, Ft8SpectrumSnapshot};
 use crate::dsp::fft::Ft8FftPlans;
+use crate::dsp::pool::{
+    run_ordered_candidates, CandidateScratchPool, PassScratchPool, PrecomputedTables,
+};
 use crate::protocol::hashtable::{sanitize_hash_call, CallsignHashTable};
-use crate::protocol::types::UnpackContext;
+use crate::protocol::types::{UnpackContext, UnpackMode};
+use crate::protocol::unpack77::unpack77_readonly;
 use crate::{DecodeConfig, DecodeTelemetry, DecodedMessage, FtxrError, Mode};
 
 use super::ap::{compute_ap_seed, ApSeed};
-use super::ft8b::{ft8b_decode_candidate_with_ap, Ft8bScratch};
+use super::ft8b::{ft8b_decode_candidate_with_options, Ft8bOutcome, Ft8bScratch};
 use super::params::{NH1, NMAX, NN};
 use super::subtract::{Ft8Subtractor, SubtractScratch};
-use super::sync8::{sync8, BitMetricMode, Sync8Scratch};
+use super::sync8::{sync8, BitMetricMode, Ft8Candidate, Sync8Scratch};
 use super::sync8d::Sync8dTables;
 
 const MAX_CAND: usize = 1000;
@@ -621,100 +625,508 @@ impl Ft8Decoder {
         ndecodes: &mut usize,
         on_decode: &mut dyn FnMut(DecodedMessage),
     ) -> Result<Vec<DecodedMessage>, FtxrError> {
-        let depth = config.depth.clamp(1, 3);
-        let npass = if depth == 1 { 2 } else { 3 };
-        let syncmin = if depth <= 2 { 2.1_f32 } else { 1.3_f32 };
-        let refine_in_pass = opts.refine_dt_subtract && depth >= 3;
+        let mut hash_snapshot = crate::protocol::hashtable::PassHashSnapshot::new();
+        let active_samples_12k = self
+            .dd
+            .iter()
+            .rposition(|&x| x != 0.0)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        decode_ft8_passes_core(
+            &self.plans,
+            &self.downsampler,
+            &self.sync8d,
+            &self.subtractor,
+            &mut self.dd,
+            &mut self.sync8_scratch,
+            &mut self.snap_scratch,
+            &mut self.snapshot,
+            &mut self.sub_scratch,
+            &mut hash_snapshot,
+            Some(&mut self.ft8b_scratch),
+            None,
+            nzhsym,
+            active_samples_12k,
+            config,
+            hash_table,
+            cancel,
+            opts,
+            seen_messages,
+            early_decodes,
+            ndecodes,
+            on_decode,
+        )
+    }
+}
 
-        let (unpack_ctx, my_call_clean, ncontest, ap_seed) = match &config.qso {
-            Some(qso) => {
-                let my_clean = qso
-                    .my_call
-                    .as_deref()
-                    .and_then(sanitize_hash_call)
-                    .filter(|c| c.len() >= 3);
-                let ctx = UnpackContext {
-                    my_call: qso.my_call.clone(),
-                    dx_call: qso.his_call.clone(),
-                    dx_base: None,
-                };
-                let seed = compute_ap_seed(qso, hash_table);
-                (ctx, my_clean, qso.contest as u8, seed)
+/// Shared parallel FT8 RX entry point used by `DecoderEngine` with pooled scratch and `rayon::ThreadPool`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ft8_shared_f32<F>(
+    samples_12k: &[f32],
+    config: &DecodeConfig,
+    tables: &PrecomputedTables,
+    pass_pool: &PassScratchPool,
+    cand_pool: &CandidateScratchPool,
+    rx_pool: Option<&rayon::ThreadPool>,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    opts: Ft8DecodeOptions,
+    mut on_decode: F,
+) -> Result<Vec<DecodedMessage>, FtxrError>
+where
+    F: FnMut(DecodedMessage),
+{
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FtxrError::Cancelled);
+    }
+    let mut pass = pass_pool.checkout();
+    let active_len = samples_12k.len().min(NMAX);
+    match opts.staged_mode {
+        Ft8StagedMode::SingleShot => {
+            for (dst, &src) in pass.dd[..active_len]
+                .iter_mut()
+                .zip(samples_12k[..active_len].iter())
+            {
+                *dst = src * 32768.0;
             }
-            None => (UnpackContext::default(), None, 0, ApSeed::default()),
+            pass.dd[active_len..].fill(0.0);
+            let mut seen_messages = HashSet::new();
+            let mut early_decodes = Vec::new();
+            let mut ndecodes = 0usize;
+            let p = &mut *pass;
+            decode_ft8_passes_core(
+                &tables.fft.ft8,
+                &tables.ft8_downsampler,
+                &tables.sync8d,
+                &tables.ft8_subtractor,
+                &mut p.dd,
+                &mut p.sync8_scratch,
+                &mut p.ft8_snap_scratch,
+                &mut p.ft8_snapshot,
+                &mut p.ft8_sub_scratch,
+                &mut p.hash_snapshot,
+                None,
+                rx_pool.map(|pool| (cand_pool, pool)),
+                50,
+                active_len,
+                config,
+                hash_table,
+                cancel,
+                opts,
+                &mut seen_messages,
+                &mut early_decodes,
+                &mut ndecodes,
+                &mut on_decode,
+            )
+        }
+        Ft8StagedMode::WsjtxThreeStage => {
+            for (dst, &src) in pass.dd_raw[..active_len]
+                .iter_mut()
+                .zip(samples_12k[..active_len].iter())
+            {
+                *dst = src * 32768.0;
+            }
+            pass.dd_raw[active_len..].fill(0.0);
+            decode_ft8_three_stage_from_pass(
+                &mut pass,
+                active_len,
+                config,
+                tables,
+                cand_pool,
+                rx_pool,
+                hash_table,
+                cancel,
+                opts,
+                &mut on_decode,
+            )
+        }
+    }
+}
+
+/// Shared parallel FT8 RX entry point over `i16` PCM using pooled scratch and `rayon::ThreadPool`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_ft8_shared_i16<F>(
+    samples_12k: &[i16],
+    config: &DecodeConfig,
+    tables: &PrecomputedTables,
+    pass_pool: &PassScratchPool,
+    cand_pool: &CandidateScratchPool,
+    rx_pool: Option<&rayon::ThreadPool>,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    opts: Ft8DecodeOptions,
+    mut on_decode: F,
+) -> Result<Vec<DecodedMessage>, FtxrError>
+where
+    F: FnMut(DecodedMessage),
+{
+    if cancel.load(Ordering::Relaxed) {
+        return Err(FtxrError::Cancelled);
+    }
+    let mut pass = pass_pool.checkout();
+    let active_len = samples_12k.len().min(NMAX);
+    match opts.staged_mode {
+        Ft8StagedMode::SingleShot => {
+            for (dst, &src) in pass.dd[..active_len]
+                .iter_mut()
+                .zip(samples_12k[..active_len].iter())
+            {
+                *dst = f32::from(src);
+            }
+            pass.dd[active_len..].fill(0.0);
+            let mut seen_messages = HashSet::new();
+            let mut early_decodes = Vec::new();
+            let mut ndecodes = 0usize;
+            let p = &mut *pass;
+            decode_ft8_passes_core(
+                &tables.fft.ft8,
+                &tables.ft8_downsampler,
+                &tables.sync8d,
+                &tables.ft8_subtractor,
+                &mut p.dd,
+                &mut p.sync8_scratch,
+                &mut p.ft8_snap_scratch,
+                &mut p.ft8_snapshot,
+                &mut p.ft8_sub_scratch,
+                &mut p.hash_snapshot,
+                None,
+                rx_pool.map(|pool| (cand_pool, pool)),
+                50,
+                active_len,
+                config,
+                hash_table,
+                cancel,
+                opts,
+                &mut seen_messages,
+                &mut early_decodes,
+                &mut ndecodes,
+                &mut on_decode,
+            )
+        }
+        Ft8StagedMode::WsjtxThreeStage => {
+            for (dst, &src) in pass.dd_raw[..active_len]
+                .iter_mut()
+                .zip(samples_12k[..active_len].iter())
+            {
+                *dst = f32::from(src);
+            }
+            pass.dd_raw[active_len..].fill(0.0);
+            decode_ft8_three_stage_from_pass(
+                &mut pass,
+                active_len,
+                config,
+                tables,
+                cand_pool,
+                rx_pool,
+                hash_table,
+                cancel,
+                opts,
+                &mut on_decode,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_ft8_three_stage_from_pass(
+    pass: &mut crate::dsp::pool::PassScratch,
+    active_len: usize,
+    config: &DecodeConfig,
+    tables: &PrecomputedTables,
+    cand_pool: &CandidateScratchPool,
+    rx_pool: Option<&rayon::ThreadPool>,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    opts: Ft8DecodeOptions,
+    on_decode: &mut dyn FnMut(DecodedMessage),
+) -> Result<Vec<DecodedMessage>, FtxrError> {
+    let depth = config.depth.clamp(1, 3);
+    let refine_early = depth >= 3;
+    let parallel = rx_pool.map(|pool| (cand_pool, pool));
+
+    let n41 = NZHSYM_41_SAMPLES.min(NMAX);
+    pass.dd[..n41].copy_from_slice(&pass.dd_raw[..n41]);
+    pass.dd[n41..].fill(0.0);
+    let mut seen_messages = HashSet::new();
+    let mut early_decodes = Vec::new();
+    let mut ndecodes = 0usize;
+    let mut all_results = decode_ft8_passes_core(
+        &tables.fft.ft8,
+        &tables.ft8_downsampler,
+        &tables.sync8d,
+        &tables.ft8_subtractor,
+        &mut pass.dd,
+        &mut pass.sync8_scratch,
+        &mut pass.ft8_snap_scratch,
+        &mut pass.ft8_snapshot,
+        &mut pass.ft8_sub_scratch,
+        &mut pass.hash_snapshot,
+        None,
+        parallel,
+        41,
+        active_len.min(n41),
+        config,
+        hash_table,
+        cancel,
+        opts,
+        &mut seen_messages,
+        &mut early_decodes,
+        &mut ndecodes,
+        on_decode,
+    )?;
+
+    let n47 = NZHSYM_47_SAMPLES.min(NMAX);
+    pass.dd[..n47].copy_from_slice(&pass.dd_raw[..n47]);
+    pass.dd[n47..].fill(0.0);
+    for rec in early_decodes.iter_mut() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        if rec.dt_raw_sec - 0.5 < 0.396 {
+            tables.ft8_subtractor.subtract(
+                &mut pass.dd,
+                &rec.itone,
+                rec.freq_hz,
+                rec.dt_raw_sec,
+                refine_early,
+                &tables.fft.ft8,
+                &mut pass.ft8_sub_scratch,
+            );
+            rec.subtracted = true;
+        }
+    }
+
+    let ndec_before_47 = early_decodes.len();
+    let stage2 = decode_ft8_passes_core(
+        &tables.fft.ft8,
+        &tables.ft8_downsampler,
+        &tables.sync8d,
+        &tables.ft8_subtractor,
+        &mut pass.dd,
+        &mut pass.sync8_scratch,
+        &mut pass.ft8_snap_scratch,
+        &mut pass.ft8_snapshot,
+        &mut pass.ft8_sub_scratch,
+        &mut pass.hash_snapshot,
+        None,
+        parallel,
+        47,
+        active_len.min(n47),
+        config,
+        hash_table,
+        cancel,
+        opts,
+        &mut seen_messages,
+        &mut early_decodes,
+        &mut ndecodes,
+        on_decode,
+    )?;
+    all_results.extend(stage2);
+
+    pass.dd[n47..].copy_from_slice(&pass.dd_raw[n47..]);
+    for rec in early_decodes.iter().take(ndec_before_47) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        if !rec.subtracted {
+            tables.ft8_subtractor.subtract(
+                &mut pass.dd,
+                &rec.itone,
+                rec.freq_hz,
+                rec.dt_raw_sec,
+                refine_early,
+                &tables.fft.ft8,
+                &mut pass.ft8_sub_scratch,
+            );
+        }
+    }
+    for rec in early_decodes.iter().skip(ndec_before_47) {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        tables.ft8_subtractor.subtract(
+            &mut pass.dd,
+            &rec.itone,
+            rec.freq_hz,
+            rec.dt_raw_sec,
+            refine_early,
+            &tables.fft.ft8,
+            &mut pass.ft8_sub_scratch,
+        );
+    }
+
+    let stage3 = decode_ft8_passes_core(
+        &tables.fft.ft8,
+        &tables.ft8_downsampler,
+        &tables.sync8d,
+        &tables.ft8_subtractor,
+        &mut pass.dd,
+        &mut pass.sync8_scratch,
+        &mut pass.ft8_snap_scratch,
+        &mut pass.ft8_snapshot,
+        &mut pass.ft8_sub_scratch,
+        &mut pass.hash_snapshot,
+        None,
+        parallel,
+        50,
+        active_len,
+        config,
+        hash_table,
+        cancel,
+        opts,
+        &mut seen_messages,
+        &mut early_decodes,
+        &mut ndecodes,
+        on_decode,
+    )?;
+    all_results.extend(stage3);
+    Ok(all_results)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_ft8_passes_core(
+    plans: &Ft8FftPlans,
+    downsampler: &Ft8Downsampler,
+    sync8d: &Sync8dTables,
+    subtractor: &Ft8Subtractor,
+    dd: &mut [f32; NMAX],
+    sync8_scratch: &mut Sync8Scratch,
+    snap_scratch: &mut DownsampleSnapshotScratch,
+    snapshot: &mut Ft8SpectrumSnapshot,
+    sub_scratch: &mut SubtractScratch,
+    hash_snapshot: &mut crate::protocol::hashtable::PassHashSnapshot,
+    mut inline_ft8b: Option<&mut Ft8bScratch>,
+    parallel: Option<(&CandidateScratchPool, &rayon::ThreadPool)>,
+    nzhsym: u8,
+    active_samples_12k: usize,
+    config: &DecodeConfig,
+    hash_table: &CallsignHashTable,
+    cancel: &AtomicBool,
+    opts: Ft8DecodeOptions,
+    seen_messages: &mut HashSet<String>,
+    early_decodes: &mut Vec<EarlyDecodeRecord>,
+    ndecodes: &mut usize,
+    on_decode: &mut dyn FnMut(DecodedMessage),
+) -> Result<Vec<DecodedMessage>, FtxrError> {
+    let depth = config.depth.clamp(1, 3);
+    let mut npass = if depth == 1 { 2 } else { 3 };
+    if config.early_pass && npass > 1 {
+        npass = 1;
+    }
+    let syncmin = if depth <= 2 { 2.1_f32 } else { 1.3_f32 };
+    let refine_in_pass = opts.refine_dt_subtract && depth >= 3;
+
+    let effective_rx_freq_hz = match config.qso.as_ref() {
+        Some(q) if (q.rx_freq_hz - 1500.0).abs() > 1e-3 => q.rx_freq_hz,
+        _ => config.rx_freq_hz,
+    };
+
+    let (unpack_ctx, my_call_clean, ncontest, ap_seed) = match &config.qso {
+        Some(qso) => {
+            let my_clean = qso
+                .my_call
+                .as_deref()
+                .and_then(sanitize_hash_call)
+                .filter(|c| c.len() >= 3);
+            let ctx = UnpackContext {
+                my_call: qso.my_call.clone(),
+                dx_call: qso.his_call.clone(),
+                dx_base: None,
+            };
+            let seed = compute_ap_seed(qso, hash_table);
+            (ctx, my_clean, qso.contest as u8, seed)
+        }
+        None => (UnpackContext::default(), None, 0, ApSeed::default()),
+    };
+
+    let mut results: Vec<DecodedMessage> = Vec::new();
+    let mut tier0: Vec<Ft8Candidate> = Vec::new();
+    let mut tier1: Vec<Ft8Candidate> = Vec::new();
+    let mut to_subtract: Vec<([u8; NN], f32, f32)> = Vec::new();
+
+    for ipass in 1..=npass {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        if ipass == 3 && *ndecodes == 0 {
+            continue;
+        }
+
+        let metric_mode = if ipass == 1 {
+            BitMetricMode::Amplitude
+        } else {
+            BitMetricMode::Power
         };
 
-        let mut results: Vec<DecodedMessage> = Vec::new();
+        let cands = sync8(
+            dd,
+            config.freq_min_hz,
+            config.freq_max_hz,
+            syncmin,
+            effective_rx_freq_hz,
+            MAX_CAND,
+            plans,
+            sync8_scratch,
+        );
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+        if cands.is_empty() {
+            continue;
+        }
 
-        for ipass in 1..=npass {
+        downsampler.compute_snapshot(dd, plans, snap_scratch, snapshot);
+        if cancel.load(Ordering::Relaxed) {
+            return Err(FtxrError::Cancelled);
+        }
+
+        let sbase_db = sync8_scratch.sbase_db();
+        let tier0_tol = config.freq_tol_hz.max(10.0);
+        tier0.clear();
+        tier1.clear();
+        if config.qso_first {
+            for cand in cands {
+                if (cand.freq_hz - effective_rx_freq_hz).abs() <= tier0_tol {
+                    tier0.push(cand);
+                } else {
+                    tier1.push(cand);
+                }
+            }
+        } else {
+            tier1 = cands;
+        }
+
+        for tier in [&tier0, &tier1] {
+            if tier.is_empty() {
+                continue;
+            }
             if cancel.load(Ordering::Relaxed) {
                 return Err(FtxrError::Cancelled);
             }
-            if ipass == 3 && *ndecodes == 0 {
-                continue;
-            }
+            hash_table.snapshot_into(hash_snapshot);
+            let hash_snap_ref = &*hash_snapshot;
+            to_subtract.clear();
 
-            let metric_mode = if ipass == 1 {
-                BitMetricMode::Amplitude
-            } else {
-                BitMetricMode::Power
-            };
-
-            let cands = sync8(
-                &self.dd,
-                config.freq_min_hz,
-                config.freq_max_hz,
-                syncmin,
-                config.rx_freq_hz,
-                MAX_CAND,
-                &self.plans,
-                &mut self.sync8_scratch,
-            );
-            if cands.is_empty() {
-                continue;
-            }
-
-            self.downsampler.compute_snapshot(
-                &self.dd,
-                &self.plans,
-                &mut self.snap_scratch,
-                &mut self.snapshot,
-            );
-
-            for cand in cands {
-                if cancel.load(Ordering::Relaxed) {
-                    return Err(FtxrError::Cancelled);
+            let mut accept_outcome = |cand: &Ft8Candidate, mut outcome: Ft8bOutcome| {
+                // If worker unpacked `<...>` against pre-pass snapshot, re-unpack now that all
+                // earlier canonical candidates in this tier have already committed to `hash_table`.
+                if outcome.message.contains("<...>") {
+                    if let Ok(re_unpacked) =
+                        unpack77_readonly(&outcome.message77, UnpackMode::Rx, &unpack_ctx, hash_table)
+                    {
+                        if !(ncontest == 0
+                            && (1..=3).contains(&outcome.i3)
+                            && (re_unpacked.text.contains("/R")
+                                || re_unpacked.text.starts_with("TU; ")))
+                        {
+                            outcome.message = re_unpacked.text;
+                            outcome.pending_hashes = re_unpacked.pending_hashes;
+                        }
+                    }
                 }
 
-                let bin = ((cand.freq_hz / 3.125).round() as usize).clamp(1, NH1);
-                let xbase = 10.0_f32.powf(0.1 * (self.sync8_scratch.sbase_db()[bin] - 40.0));
-
-                let Some(outcome) = ft8b_decode_candidate_with_ap(
-                    &self.snapshot,
-                    &cand,
-                    xbase,
-                    depth,
-                    nzhsym,
-                    metric_mode,
-                    false,
-                    ncontest,
-                    config.qso.as_ref(),
-                    &ap_seed,
-                    &self.plans,
-                    &self.downsampler,
-                    &self.sync8d,
-                    &unpack_ctx,
-                    hash_table,
-                    &mut self.ft8b_scratch,
-                ) else {
-                    continue;
-                };
-
-                if seen_messages.contains(&outcome.message) {
-                    continue;
-                }
-                if *ndecodes >= MAX_DECODES_PER_SLOT {
-                    continue;
+                if seen_messages.contains(&outcome.message) || *ndecodes >= MAX_DECODES_PER_SLOT {
+                    return;
                 }
 
                 *ndecodes += 1;
@@ -730,15 +1142,7 @@ impl Ft8Decoder {
                     });
                 }
 
-                self.subtractor.subtract(
-                    &mut self.dd,
-                    &outcome.itone,
-                    outcome.freq_hz,
-                    outcome.dt_raw_sec,
-                    refine_in_pass,
-                    &self.plans,
-                    &mut self.sub_scratch,
-                );
+                to_subtract.push((outcome.itone, outcome.freq_hz, outcome.dt_raw_sec));
 
                 let mut dt_sec = outcome.dt_raw_sec - 0.5;
                 if opts.eme_delay {
@@ -756,8 +1160,8 @@ impl Ft8Decoder {
                         hard_errors: outcome.nhard_errors.max(0) as u16,
                         osd_distance: outcome.dmin,
                         quality: outcome.qual,
-                        freq_drift_hz: None,
-                        qsb_envelope: None,
+                        freq_drift_hz: outcome.freq_drift_hz,
+                        qsb_envelope: outcome.qsb_envelope.clone(),
                     })
                 } else {
                     None
@@ -775,11 +1179,99 @@ impl Ft8Decoder {
                 };
                 on_decode(decoded.clone());
                 results.push(decoded);
+            };
+
+            if let Some(pool_pair) = parallel {
+                run_ordered_candidates(
+                    tier,
+                    Some(pool_pair),
+                    cancel,
+                    |cand, cand_scratch| {
+                        let bin = ((cand.freq_hz / 3.125).round() as usize).clamp(1, NH1);
+                        let xbase = 10.0_f32.powf(0.1 * (sbase_db[bin] - 40.0));
+                        ft8b_decode_candidate_with_options(
+                            snapshot,
+                            cand,
+                            xbase,
+                            depth,
+                            nzhsym,
+                            metric_mode,
+                            false,
+                            ncontest,
+                            config.qso.as_ref(),
+                            &ap_seed,
+                            plans,
+                            downsampler,
+                            sync8d,
+                            &unpack_ctx,
+                            hash_snap_ref,
+                            &mut cand_scratch.ft8b,
+                            cancel,
+                            config.enable_telemetry,
+                            active_samples_12k,
+                            config.early_pass,
+                        )
+                    },
+                    |idx, outcome| {
+                        accept_outcome(&tier[idx], outcome);
+                    },
+                );
+            } else if let Some(ft8b_scratch) = inline_ft8b.as_deref_mut() {
+                for cand in tier.iter() {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err(FtxrError::Cancelled);
+                    }
+                    let bin = ((cand.freq_hz / 3.125).round() as usize).clamp(1, NH1);
+                    let xbase = 10.0_f32.powf(0.1 * (sbase_db[bin] - 40.0));
+                    if let Some(outcome) = ft8b_decode_candidate_with_options(
+                        snapshot,
+                        cand,
+                        xbase,
+                        depth,
+                        nzhsym,
+                        metric_mode,
+                        false,
+                        ncontest,
+                        config.qso.as_ref(),
+                        &ap_seed,
+                        plans,
+                        downsampler,
+                        sync8d,
+                        &unpack_ctx,
+                        hash_snap_ref,
+                        ft8b_scratch,
+                        cancel,
+                        config.enable_telemetry,
+                        active_samples_12k,
+                        config.early_pass,
+                    ) {
+                        accept_outcome(cand, outcome);
+                    }
+                }
+            }
+
+            if cancel.load(Ordering::Relaxed) {
+                return Err(FtxrError::Cancelled);
+            }
+
+            for (itone, freq_hz, dt_raw_sec) in to_subtract.drain(..) {
+                if cancel.load(Ordering::Relaxed) {
+                    return Err(FtxrError::Cancelled);
+                }
+                subtractor.subtract(
+                    dd,
+                    &itone,
+                    freq_hz,
+                    dt_raw_sec,
+                    refine_in_pass,
+                    plans,
+                    sub_scratch,
+                );
             }
         }
-
-        Ok(results)
     }
+
+    Ok(results)
 }
 
 #[cfg(test)]
@@ -790,7 +1282,7 @@ mod tests {
 
     #[test]
     fn scale_invariance_holds_across_100x_amplitude_range() {
-        let mut engine = crate::DecoderEngine::new();
+        let engine = crate::DecoderEngine::new();
         let mcfg = ModulateConfig::default_for(Mode::Ft8, 1500.0, 12_000);
         let ht = CallsignHashTable::new();
         let ctx = UnpackContext::default();

@@ -2043,7 +2043,7 @@ fn run_suite_loopback(
     jt9: &Jt9Runner,
     wisdom: Option<&Path>,
 ) -> Result<LoopbackSummary, Stage4Error> {
-    let mut engine = DecoderEngine::new();
+    let engine = DecoderEngine::new();
     let cfg_rx = DecodeConfig::for_mode(Mode::Ft4);
     let tmp = tempfile::tempdir()?;
 
