@@ -10,6 +10,7 @@ use std::sync::Arc;
 use realfft::{RealFftPlanner, RealToComplex};
 use rustfft::{Fft, FftPlanner};
 
+use crate::ft4::params as ft4_params;
 use crate::ft8::params::{DOWN_NFFT1, DOWN_NFFT2, NFFT1, SUB_NFFT};
 
 /// Immutable, thread-safe collection of pre-planned FT8 FFTs.
@@ -65,6 +66,67 @@ impl Ft8FftPlans {
     }
 }
 
+/// Immutable, thread-safe collection of pre-planned 7-smooth FT4 FFTs.
+///
+/// Shared inside `Ft4Decoder` / `DecoderEngine` for zero per-slot replanning.
+#[derive(Clone)]
+pub struct Ft4FftPlans {
+    pub r2c_2304: Arc<dyn RealToComplex<f32>>,
+    pub r2c_72576: Arc<dyn RealToComplex<f32>>,
+    pub c2c_inv_4032: Arc<dyn Fft<f32>>,
+    pub c2c_fwd_32: Arc<dyn Fft<f32>>,
+    pub c2c_fwd_72576: Arc<dyn Fft<f32>>,
+    pub c2c_inv_72576: Arc<dyn Fft<f32>>,
+}
+
+impl fmt::Debug for Ft4FftPlans {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Ft4FftPlans")
+            .field("r2c_2304_scratch", &self.r2c_2304.get_scratch_len())
+            .field("r2c_72576_scratch", &self.r2c_72576.get_scratch_len())
+            .field(
+                "c2c_inv_4032_scratch",
+                &self.c2c_inv_4032.get_inplace_scratch_len(),
+            )
+            .field(
+                "c2c_fwd_32_scratch",
+                &self.c2c_fwd_32.get_inplace_scratch_len(),
+            )
+            .field(
+                "c2c_fwd_72576_scratch",
+                &self.c2c_fwd_72576.get_inplace_scratch_len(),
+            )
+            .field(
+                "c2c_inv_72576_scratch",
+                &self.c2c_inv_72576.get_inplace_scratch_len(),
+            )
+            .finish()
+    }
+}
+
+impl Default for Ft4FftPlans {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ft4FftPlans {
+    /// Plans all 7-smooth FT4 FFT transforms once.
+    pub fn new() -> Self {
+        let mut r2c = RealFftPlanner::<f32>::new();
+        let mut c2c = FftPlanner::<f32>::new();
+
+        Self {
+            r2c_2304: r2c.plan_fft_forward(ft4_params::NFFT1),
+            r2c_72576: r2c.plan_fft_forward(ft4_params::NMAX),
+            c2c_inv_4032: c2c.plan_fft_inverse(ft4_params::NDMAX),
+            c2c_fwd_32: c2c.plan_fft_forward(ft4_params::NSS),
+            c2c_fwd_72576: c2c.plan_fft_forward(ft4_params::NMAX),
+            c2c_inv_72576: c2c.plan_fft_inverse(ft4_params::NMAX),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +171,70 @@ mod tests {
             .unwrap();
         assert!((r_out[100].re - (NFFT1 as f32) * 0.5).abs() < 1e-2);
         assert!(r_out[100].im.abs() < 1e-2);
+    }
+
+    #[test]
+    fn ft4_fft_plans_roundtrip_accuracy() {
+        let plans = Ft4FftPlans::new();
+
+        // 72,576-point C2C forward + inverse roundtrip
+        let n72 = ft4_params::NMAX;
+        let orig72: Vec<Complex32> = (0..n72)
+            .map(|i| {
+                let p = (i as f32) * 0.0317;
+                Complex32::new(p.cos() * 0.7, (p * 1.3).sin() * 0.4)
+            })
+            .collect();
+        let mut work72 = orig72.clone();
+        let mut scratch72 = vec![
+            Complex32::ZERO;
+            plans
+                .c2c_fwd_72576
+                .get_inplace_scratch_len()
+                .max(plans.c2c_inv_72576.get_inplace_scratch_len())
+        ];
+        plans.c2c_fwd_72576.process_with_scratch(&mut work72, &mut scratch72);
+        plans.c2c_inv_72576.process_with_scratch(&mut work72, &mut scratch72);
+        let mut num_err = 0.0_f64;
+        let mut denom = 0.0_f64;
+        for (a, b) in orig72.iter().zip(work72.iter()) {
+            let rec = *b / (n72 as f32);
+            let d = (a - rec).norm() as f64;
+            num_err += d * d;
+            let n = a.norm() as f64;
+            denom += n * n;
+        }
+        let rel_l2_72 = (num_err / denom).sqrt();
+        assert!(rel_l2_72 < 1e-6, "72576 c2c rel_l2={rel_l2_72}");
+
+        // 72,576-point R2C bin check for real cosine
+        let mut r72: Vec<f32> = (0..n72)
+            .map(|i| (std::f64::consts::TAU * 313.0 * (i as f64) / (n72 as f64)).cos() as f32)
+            .collect();
+        let mut r72_out = plans.r2c_72576.make_output_vec();
+        let mut r72_scratch = plans.r2c_72576.make_scratch_vec();
+        plans
+            .r2c_72576
+            .process_with_scratch(&mut r72, &mut r72_out, &mut r72_scratch)
+            .unwrap();
+        assert!((r72_out[313].re - (n72 as f32) * 0.5).abs() < 1e-1);
+        assert!(r72_out[313].im.abs() < 1e-1);
+
+        // 4,032-point C2C inverse transforms impulse at bin k0 -> complex sinusoid exp(+j*2*pi*k0*n/N)
+        let n4 = ft4_params::NDMAX;
+        let k0 = 37usize;
+        let mut buf4 = vec![Complex32::ZERO; n4];
+        buf4[k0] = Complex32::new(n4 as f32, 0.0);
+        let mut s4 = vec![Complex32::ZERO; plans.c2c_inv_4032.get_inplace_scratch_len()];
+        plans.c2c_inv_4032.process_with_scratch(&mut buf4, &mut s4);
+        let mut num4 = 0.0_f64;
+        for (idx, &val) in buf4.iter().enumerate() {
+            let phi = std::f64::consts::TAU * (k0 as f64) * (idx as f64) / (n4 as f64);
+            let exp_val = Complex32::new(phi.cos() as f32, phi.sin() as f32);
+            let d = (val / (n4 as f32) - exp_val).norm() as f64;
+            num4 += d * d;
+        }
+        let rel_l2_4 = (num4 / (n4 as f64)).sqrt();
+        assert!(rel_l2_4 < 1e-6, "4032 c2c_inv rel_l2={rel_l2_4}");
     }
 }

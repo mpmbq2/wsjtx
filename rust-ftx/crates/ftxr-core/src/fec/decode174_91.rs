@@ -100,4 +100,46 @@ mod tests {
             .sum();
         assert!((dec.dmin - expected_dmin).abs() < 1e-4);
     }
+
+    #[test]
+    fn max_osd_3_rescues_third_bp_iteration_when_max_osd_2_fails() {
+        let ht = CallsignHashTable::new();
+        let ctx = UnpackContext::default();
+        let packed = pack77("CQ K1ABC FN42", None, &ctx, &ht).unwrap();
+        let cw = encode174_91(&packed.bits);
+        let apmask = [0u8; LDPC_N];
+        let mut osd_scratch = OsdScratch::new();
+
+        // Check `max_osd = 3` saves 3 BP snapshots (`num_zsave == 3`) and can rescue on zsave[2].
+        let mut found = false;
+        'search: for sigma in [1.05_f32, 1.15, 1.25, 1.35] {
+            for seed in 1u64..800 {
+                let mut state = seed
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15)
+                    .wrapping_add((sigma * 1000.0) as u64);
+                let mut llr = [0.0_f32; LDPC_N];
+                for (i, slot) in llr.iter_mut().enumerate() {
+                    // Sum of 4 uniforms approximates zero-mean unit-variance Gaussian nicely.
+                    let mut nsum = -2.0_f32;
+                    for _ in 0..4 {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        nsum += ((state >> 32) as f32) / (u32::MAX as f32);
+                    }
+                    let gauss = nsum * 1.732_050_8; // unit variance
+                    let x = if cw[i] == 1 { 1.0_f32 } else { -1.0_f32 };
+                    *slot = (x + sigma * gauss) * (2.0 / (sigma * sigma));
+                }
+                if decode174_91(&llr, 91, 2, 1, &apmask, &mut osd_scratch).is_none() {
+                    if let Some(dec3) = decode174_91(&llr, 91, 3, 1, &apmask, &mut osd_scratch) {
+                        assert_eq!(dec3.codeword, cw);
+                        found = true;
+                        break 'search;
+                    }
+                }
+            }
+        }
+        assert!(found, "expected a deterministic corruption rescued by max_osd=3 only");
+    }
 }

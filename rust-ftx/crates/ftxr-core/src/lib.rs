@@ -317,6 +317,7 @@ pub enum FtxrError {
 pub struct DecoderEngine {
     hash_table: protocol::hashtable::CallsignHashTable,
     ft8_decoder: ft8::decoder::Ft8Decoder,
+    ft4_decoder: ft4::decoder::Ft4Decoder,
 }
 
 impl DecoderEngine {
@@ -325,6 +326,7 @@ impl DecoderEngine {
         Self {
             hash_table: protocol::hashtable::CallsignHashTable::new(),
             ft8_decoder: ft8::decoder::Ft8Decoder::new(),
+            ft4_decoder: ft4::decoder::Ft4Decoder::new(),
         }
     }
 
@@ -336,6 +338,11 @@ impl DecoderEngine {
     /// Returns a reference to the pre-allocated FT8 decoder (for advanced/oracle options).
     pub fn ft8_decoder_mut(&mut self) -> &mut ft8::decoder::Ft8Decoder {
         &mut self.ft8_decoder
+    }
+
+    /// Returns a reference to the pre-allocated FT4 decoder (for advanced/oracle options).
+    pub fn ft4_decoder_mut(&mut self) -> &mut ft4::decoder::Ft4Decoder {
+        &mut self.ft4_decoder
     }
 
     /// Clears session-scoped state (callsign hash tables) between bands or operating sessions.
@@ -374,7 +381,14 @@ impl DecoderEngine {
                 ft8::decoder::Ft8DecodeOptions::default(),
                 on_decode,
             ),
-            Mode::Ft4 => Err(FtxrError::Unimplemented("FT4 RX decoder (Stage 4)")),
+            Mode::Ft4 => self.ft4_decoder.decode_f32(
+                samples_12k,
+                cfg,
+                &self.hash_table,
+                Some(cancel),
+                ft4::decoder::Ft4DecodeOptions::default(),
+                on_decode,
+            ),
         }
     }
 
@@ -408,7 +422,14 @@ impl DecoderEngine {
                 ft8::decoder::Ft8DecodeOptions::default(),
                 on_decode,
             ),
-            Mode::Ft4 => Err(FtxrError::Unimplemented("FT4 RX decoder (Stage 4)")),
+            Mode::Ft4 => self.ft4_decoder.decode_i16(
+                samples_12k,
+                cfg,
+                &self.hash_table,
+                Some(cancel),
+                ft4::decoder::Ft4DecodeOptions::default(),
+                on_decode,
+            ),
         }
     }
 
@@ -542,13 +563,21 @@ mod tests {
     }
 
     #[test]
-    fn ft8_modulate_and_decode_roundtrip_and_ft4_stub() {
+    fn ft8_and_ft4_modulate_and_decode_roundtrip() {
         let mut engine = DecoderEngine::new();
-        let cfg_ft4 = DecodeConfig::for_mode(Mode::Ft4);
-        assert!(matches!(
-            engine.decode(&[], &cfg_ft4),
-            Err(FtxrError::Unimplemented(_))
-        ));
+        let mut cfg_ft4 = DecodeConfig::for_mode(Mode::Ft4);
+        cfg_ft4.depth = 1;
+        assert!(engine.decode(&[], &cfg_ft4).unwrap().is_empty());
+
+        let mcfg_ft4 = ModulateConfig::default_for(Mode::Ft4, 1500.0, 12_000);
+        let pcm_ft4 = engine.modulate("CQ K1ABC FN42", &mcfg_ft4).unwrap();
+        assert_eq!(pcm_ft4.len(), 3_600 + 60_480);
+
+        let decoded_ft4 = engine.decode(&pcm_ft4, &cfg_ft4).unwrap();
+        assert_eq!(decoded_ft4.len(), 1);
+        assert_eq!(decoded_ft4[0].message, "CQ K1ABC FN42");
+        assert_eq!(decoded_ft4[0].mode, Mode::Ft4);
+        assert!((decoded_ft4[0].af_hz - 1500.0).abs() < 1.0);
 
         let mcfg = ModulateConfig::default_for(Mode::Ft8, 1500.0, 12_000);
         let pcm = engine.modulate("CQ N0AAA EM10", &mcfg).unwrap();

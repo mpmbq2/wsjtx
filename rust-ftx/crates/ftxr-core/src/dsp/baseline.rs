@@ -6,6 +6,7 @@
 
 use num_complex::Complex32;
 
+use crate::ft4::params as ft4_params;
 use crate::ft8::params::{NFFT1, NH1, NMAX};
 
 use super::fft::Ft8FftPlans;
@@ -188,6 +189,87 @@ pub fn fit_ft8_baseline_db(
     }
 }
 
+/// Port of `wsjtx/lib/ft4/ft4_baseline.f90`: fits a quartic dB baseline (`+ 0.65 dB`)
+/// over 1-based bins `[ia..=ib]` and converts the fitted baseline back to **linear** power.
+///
+/// `s_linear` and `sbase_linear` are 1-based-bin indexed (`len == ft4::params::NH1 + 1 == 1153`,
+/// index `0` unused). Unlike Fortran, `s_linear` is not mutated in-place.
+pub fn fit_ft4_baseline_linear(
+    s_linear: &[f32],
+    nfa: usize,
+    nfb: usize,
+    sbase_linear: &mut [f32],
+) {
+    let nh1 = ft4_params::NH1;
+    assert!(s_linear.len() > nh1);
+    assert!(sbase_linear.len() > nh1);
+
+    const NSEG: usize = 10;
+    const NPCT: u32 = 10;
+
+    sbase_linear[..=nh1].fill(0.0);
+
+    let df = 12_000.0_f32 / (ft4_params::NFFT1 as f32);
+    let ia_min = (200.0_f32 / df).round() as usize;
+    let ia = ia_min.max(nfa).clamp(1, nh1);
+    let ib = nh1.min(nfb);
+    if ib < ia {
+        return;
+    }
+
+    let span = ib - ia + 1;
+    let nlen = span / NSEG;
+    if nlen == 0 {
+        return;
+    }
+
+    // Silence guard: avoid 10*log10(0) poisoning polyfit on all-zero / NaN spectra.
+    if s_linear[ia..=ib].iter().all(|&v| v <= 0.0 || !v.is_finite()) {
+        return;
+    }
+
+    let mut s_db = [0.0_f32; ft4_params::NH1 + 1];
+    for i in ia..=ib {
+        let v = if s_linear[i].is_finite() {
+            s_linear[i].max(1e-30)
+        } else {
+            1e-30
+        };
+        s_db[i] = 10.0 * v.log10();
+    }
+
+    // Matches `i0 = (ib - ia + 1) / 2` in `ft4_baseline.f90`.
+    let i0 = (span / 2) as isize;
+    let mut x = [0.0_f64; 1000];
+    let mut y = [0.0_f64; 1000];
+    let mut k = 0usize;
+    let mut seg_tmp = vec![0.0_f32; nlen];
+
+    for n in 0..NSEG {
+        let ja = ia + n * nlen;
+        let jb = ja + nlen - 1;
+        seg_tmp.copy_from_slice(&s_db[ja..=jb]);
+        let base = pctile_in_place(&mut seg_tmp, NPCT);
+        for (i, &val_db) in s_db.iter().enumerate().take(jb + 1).skip(ja) {
+            if val_db <= base {
+                let slot = k.min(999);
+                x[slot] = ((i as isize) - i0) as f64;
+                y[slot] = f64::from(val_db);
+                if k < 1000 {
+                    k += 1;
+                }
+            }
+        }
+    }
+
+    let a = polyfit_5(&x[..k], &y[..k]);
+    for (i, out_lin) in sbase_linear.iter_mut().enumerate().take(ib + 1).skip(ia) {
+        let t = ((i as isize) - i0) as f64;
+        let val_db = (a[0] + t * (a[1] + t * (a[2] + t * (a[3] + t * a[4]))) + 0.65) as f32;
+        *out_lin = 10.0_f32.powf(0.1 * val_db);
+    }
+}
+
 /// Scratch buffers for `compute_ft8_spectrum_baseline` (zero per-call heap allocations).
 pub struct BaselineScratch {
     savg: Vec<f32>,
@@ -346,6 +428,56 @@ mod tests {
         let (lo, hi) =
             compute_ft8_spectrum_baseline(&dd, 50.0, 5500.0, &plans, &win, &mut scratch, &mut sbase);
         assert_eq!((lo, hi), (100.0, 4910.0));
+        assert!(sbase.iter().all(|&v| v == 0.0 && v.is_finite()));
+    }
+
+    #[test]
+    fn ft4_baseline_tracks_sloped_floor_and_handles_edge_cases() {
+        let nh1 = ft4_params::NH1;
+        let nfa = 38usize;
+        let nfb = 943usize;
+        let mut savg = vec![0.0_f32; nh1 + 1];
+        for (i, val) in savg.iter_mut().enumerate().take(nfb + 1).skip(nfa) {
+            // Smooth tilted baseline in dB (~ +20 dB at nfa to +15 dB at nfb)
+            let frac = (i - nfa) as f32 / (nfb - nfa) as f32;
+            let db = 20.0 - 5.0 * frac + 1.5 * (frac * std::f32::consts::PI).sin();
+            *val = 10.0_f32.powf(0.1 * db);
+        }
+        // Inject strong narrow spikes (FT4 signals) that must not pull up the 10%-ile baseline
+        for &peak_bin in &[150usize, 320, 610, 820] {
+            for v in &mut savg[(peak_bin - 2)..=(peak_bin + 2)] {
+                *v *= 100.0;
+            }
+        }
+        let mut sbase = vec![0.0_f32; nh1 + 1];
+        fit_ft4_baseline_linear(&savg, nfa, nfb, &mut sbase);
+
+        // Expect linear baseline near truth * 10^(+0.65/10) ≈ truth * 1.1614
+        let expected_scale = 10.0_f32.powf(0.065);
+        for &check_bin in &[150usize, 320, 610, 820] {
+            let frac = (check_bin - nfa) as f32 / (nfb - nfa) as f32;
+            let true_db = 20.0 - 5.0 * frac + 1.5 * (frac * std::f32::consts::PI).sin();
+            let expected = 10.0_f32.powf(0.1 * true_db) * expected_scale;
+            let rel_err = (sbase[check_bin] - expected).abs() / expected;
+            assert!(
+                rel_err < 0.05,
+                "bin {check_bin}: got {}, expected {expected} (rel_err={rel_err})",
+                sbase[check_bin]
+            );
+        }
+        // Bins outside [nfa..=nfb] stay zero
+        assert!(sbase[1..nfa].iter().all(|&v| v == 0.0));
+        assert!(sbase[(nfb + 1)..=nh1].iter().all(|&v| v == 0.0));
+
+        // All-zero / silent spectrum and invalid/degenerate range guards produce zeros without NaNs
+        let zero_spec = vec![0.0_f32; nh1 + 1];
+        fit_ft4_baseline_linear(&zero_spec, nfa, nfb, &mut sbase);
+        assert!(sbase.iter().all(|&v| v == 0.0 && v.is_finite()));
+
+        fit_ft4_baseline_linear(&savg, 500, 100, &mut sbase);
+        assert!(sbase.iter().all(|&v| v == 0.0 && v.is_finite()));
+
+        fit_ft4_baseline_linear(&savg, 0, 0, &mut sbase);
         assert!(sbase.iter().all(|&v| v == 0.0 && v.is_finite()));
     }
 }

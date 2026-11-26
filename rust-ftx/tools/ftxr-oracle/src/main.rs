@@ -4,10 +4,11 @@
 
 //! Development-only WSJT-X oracle harness (`ftxr-oracle`).
 //!
-//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`, `osd-oracle`, `ft8-stage3`.
+//! Subcommands: `smoke`, `init-committed`, `generate`, `run-jt9`, `baseline`, `compare`, `codec-diff`, `tx-loopback`, `stage2-verify`, `ft8-mvp-bench`, `osd-oracle`, `ft8-stage3`, `ft4-stage4`.
 
 mod codec_oracle;
 mod corpus;
+mod ft4_stage4;
 mod ft8_mvp_bench;
 mod ft8_stage3;
 mod jt9;
@@ -266,6 +267,22 @@ enum Commands {
         #[arg(long)]
         out: Option<PathBuf>,
     },
+
+    /// Execute Stage 4 FT4 RX parity & exit-gate oracle verification harness.
+    Ft4Stage4 {
+        /// Comma-separated suites to run (all, dump-diff, real-corpus, crowded, awgn, ap-matrix, noise, loopback).
+        #[arg(long, value_enum, value_delimiter = ',', default_values_t = [ft4_stage4::Ft4Stage4Suite::All])]
+        suites: Vec<ft4_stage4::Ft4Stage4Suite>,
+        /// AWGN trials per SNR point in -13..-21 dB (default 100 for Stage 4 gate).
+        #[arg(long, default_value_t = 100)]
+        trials: usize,
+        /// Pure-AWGN noise slots per mode (default 300 for Stage 4 gate).
+        #[arg(long, default_value_t = 300)]
+        noise_slots: usize,
+        /// Optional JSON report output path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+    },
 }
 
 fn default_rust_ftx_root() -> PathBuf {
@@ -487,6 +504,31 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 resume_cache: resume,
             };
             ft8_stage3::run_stage3_suites(
+                &wsjtx_root,
+                &rust_ftx_root,
+                &resolved_bin_dir,
+                &cache_dir,
+                &jt9,
+                &opts,
+                out.as_deref(),
+            )?;
+        }
+        Commands::Ft4Stage4 {
+            suites,
+            trials,
+            noise_slots,
+            out,
+        } => {
+            let sim = SimRunner::new(bin_dir, cache_dir.clone());
+            let resolved_bin_dir = sim.bin_path("jt9").parent().unwrap().to_path_buf();
+            let jt9 = Jt9Runner::new(resolved_bin_dir.clone(), cache_dir.clone());
+            let opts = ft4_stage4::Stage4Options {
+                suites: suites.into_iter().collect(),
+                trials,
+                noise_slots,
+                jobs,
+            };
+            ft4_stage4::run_stage4_suites(
                 &wsjtx_root,
                 &rust_ftx_root,
                 &resolved_bin_dir,

@@ -50,3 +50,95 @@ pub const ICOS4_C: [u8; 4] = [2, 3, 1, 0];
 pub const ICOS4_D: [u8; 4] = [3, 2, 0, 1];
 /// 2-bit Gray mapping from 2 codeword bits to 4-FSK tone index.
 pub const GRAYMAP: [u8; 4] = [0, 1, 3, 2];
+
+/// Downsampled samples per FT4 symbol (`NSPS / NDOWN = 576 / 18 = 32`).
+pub const NSS: usize = NSPS / NDOWN;
+
+/// Total downsampled complex samples over `NMAX` (`72_576 / 18 = 4_032`).
+pub const NDMAX: usize = NMAX / NDOWN;
+
+/// Downsampled complex samples per FT4 frame (`NN * NSS = 103 * 32 = 3_296`).
+pub const NFRAME_DOWN: usize = NN * NSS;
+
+/// Total channel bits per FT4 frame (`2 * NN = 206`).
+pub const NBITS: usize = 2 * NN;
+
+/// LDPC codeword length (`174`).
+pub const NCW: usize = N;
+
+/// Maximum number of frequency candidates returned by `getcandidates4`.
+pub const MAXCAND: usize = 200;
+
+/// Minimum spectral sync ratio threshold in `getcandidates4`.
+pub const SYNCMIN: f32 = 1.18;
+
+/// Minimum `sync4d` correlation threshold in `ft4_decode`.
+pub const SYNC4D_MIN: f32 = 1.2;
+
+/// Empirical LLR scaling factor applied to raw bit metrics before LDPC/OSD (`scalefac = 2.83`).
+pub const SCALEFAC: f32 = 2.83;
+
+/// Half-width in Hz around `rx_freq_hz` for AP `a3`/`a6` passes and `maxosd = 3` (`napwid = 50`).
+pub const NAPWID_HZ: f32 = 50.0;
+
+/// Half-width in Hz around `rx_freq_hz` prioritized first in candidate list (`getcandidates4`).
+pub const NFQSO_PRIOR_HZ: f32 = 20.0;
+
+/// Minimum and maximum candidate audio frequency bounds in `getcandidates4` (Hz).
+pub const MIN_FREQ_HZ: f32 = 200.0;
+pub const MAX_FREQ_HZ: f32 = 4910.0;
+
+/// FT4 frequency offset applied in `getcandidates4` (`-1.5 * 12000.0 / 576.0 = -31.25 Hz`).
+pub const F_OFFSET_HZ: f32 = -1.5 * (SAMPLE_RATE_HZ as f32) / (NSPS as f32);
+
+/// FT4 tone spacing / baud rate in Hz (`12000 / 576 = 20.833334 Hz`).
+pub const F_BAUD: f32 = (SAMPLE_RATE_HZ as f32) / (NSPS as f32);
+
+/// Coarse spectrogram frequency bin width in Hz (`12000 / 2304 = 5.2083335 Hz`).
+pub const DF_SPECTRUM: f32 = (SAMPLE_RATE_HZ as f32) / (NFFT1 as f32);
+
+/// Full-length FFT frequency bin width in Hz (`12000 / 72576 = 0.16534391 Hz`).
+pub const DF_DOWNSAMPLE: f32 = (SAMPLE_RATE_HZ as f32) / (NMAX as f32);
+
+/// Downsampled complex sample rate in Hz (`12000 / 18 = 666.6667 Hz`).
+pub const FS_DOWNSAMPLE: f32 = (SAMPLE_RATE_HZ as f32) / (NDOWN as f32);
+
+/// Literal divisor used in WSJT-X `ft4_decode.f90` for reported `dt` (`ibest / 666.67 - 0.5`).
+pub const DT_RATE_LITERAL: f32 = 666.67;
+
+/// Nominal DT offset in seconds subtracted in `ft4_decode.f90`.
+pub const DT_OFFSET_S: f32 = 0.5;
+
+/// Empirical SNR calibration offset in dB (`10*log10(snr) - 14.8`).
+pub const SNR_OFFSET_DB: f32 = 14.8;
+
+/// Lower floor for reported FT4 SNR in dB (`-21`).
+pub const SNR_FLOOR_DB: f32 = -21.0;
+
+/// Minimum hard-decision Costas symbol matches required in `get_ft4_bitmetrics` (`8` of `16`).
+pub const NSYNC_MIN: usize = 8;
+
+/// Minimum hard-decision Costas bit matches required in `ft4_decode` (`20` of `32`).
+pub const NSYNC_QUAL_MIN: usize = 20;
+
+/// Low-pass moving-average window length in `subtractft4` (`NFILT = 1400`).
+pub const SUBTRACT_NFILT: usize = 1400;
+
+/// Cyclic shift applied to `cw` filter kernel in `subtractft4` (`NFILT / 2 + 1 = 701`).
+pub const SUBTRACT_SHIFT: usize = SUBTRACT_NFILT / 2 + 1;
+
+/// Hard-decision Gray-mapped bits corresponding to `ICOS4_A` (`[0, 1, 3, 2]`).
+pub const SYNC_BITS_A: [u8; 8] = [0, 0, 0, 1, 1, 0, 1, 1];
+/// Hard-decision Gray-mapped bits corresponding to `ICOS4_B` (`[1, 0, 2, 3]`).
+pub const SYNC_BITS_B: [u8; 8] = [0, 1, 0, 0, 1, 1, 1, 0];
+/// Hard-decision Gray-mapped bits corresponding to `ICOS4_C` (`[2, 3, 1, 0]`).
+pub const SYNC_BITS_C: [u8; 8] = [1, 1, 1, 0, 0, 1, 0, 0];
+/// Hard-decision Gray-mapped bits corresponding to `ICOS4_D` (`[3, 2, 0, 1]`).
+pub const SYNC_BITS_D: [u8; 8] = [1, 0, 1, 1, 0, 0, 0, 1];
+
+/// Symbol offsets of the four 4-symbol Costas arrays in an FT4 frame (`NN = 103`).
+pub const SYNC_POSITIONS: [usize; 4] = [0, 33, 66, 99];
+
+/// Three `ib` search windows evaluated per candidate in `ft4_decode.f90`.
+pub const DT_SEGMENTS: [(i32, i32); 3] = [(108, 560), (560, 1012), (-344, 108)];
+
